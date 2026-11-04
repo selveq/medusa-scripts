@@ -71,7 +71,7 @@ Universal SSL covers one subdomain level: `app.example.com` works,
 ## Notes
 
 - Postgres and Redis bind to `127.0.0.1`; nginx routes `/app`, `/admin`, `/auth`, `/store`, `/hooks`, `/health` to the backend, the rest to the storefront.
-- Ports allocate to the closest free one and stay pinned until `--reset`.
+- Ports allocate to the closest free one and stay pinned until `--reset`. `start` and `restart` say when one is not the preferred port.
 - A recorded pid is checked against the process start time before being signalled.
 - `start` waits for a dev server that is restarting instead of launching a second one.
 - `stop` waits up to 10 s for each dev server and its children to exit, then kills what is left.
