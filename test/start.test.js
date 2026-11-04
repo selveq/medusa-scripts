@@ -138,6 +138,48 @@ test('start still launches a dev server when the recorded one is gone', () => {
     assert.strictEqual(devRuns(dir).filter((run) => run.cwd.endsWith('backend')).length, 1, r.out)
 })
 
+test('stop returns only once a dev server has finished shutting down', () => {
+    const dir = project()
+    const done = path.join(dir, 'shut-down')
+    const pid = daemon(dir, ['pretend-backend', done], `
+        process.on('SIGTERM', () => setTimeout(() => {
+            require('fs').writeFileSync(process.argv[2], '1')
+            process.exit(0)
+        }, 1500))
+        setInterval(() => {}, 1000)
+    `)
+    try {
+        record(dir, 'backend', pid)
+        const r = local(['stop'], { cwd: dir })
+        assert.strictEqual(r.status, 0, r.out)
+        assert.ok(fs.existsSync(done), 'its port is free by the time stop returns')
+        assert.doesNotMatch(r.out, /still running/)
+    } finally { killQuietly(pid) }
+})
+
+test('stop ends a child that ignores SIGTERM after its parent has exited', () => {
+    const dir = project()
+    const childFile = path.join(dir, 'child.pid')
+    const pid = daemon(dir, ['pretend-backend', childFile], `
+        const script = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"
+        const child = require('child_process').spawn(process.execPath, ['-e', script], { stdio: 'ignore' })
+        require('fs').writeFileSync(process.argv[2], String(child.pid))
+        process.on('SIGTERM', () => process.exit(0))
+        setInterval(() => {}, 1000)
+    `)
+    for (let i = 0; !fs.existsSync(childFile) && i < 50; i++) sleep(100)
+    sleep(300)
+    const child = Number(fs.readFileSync(childFile, 'utf8'))
+    try {
+        record(dir, 'backend', pid)
+        const r = local(['stop'], { cwd: dir })
+        assert.strictEqual(r.status, 0, r.out)
+        assert.match(r.out, new RegExp(`still running after 10s, killing: ${child}`))
+        for (let i = 0; alive(child) && i < 50; i++) sleep(100)
+        assert.ok(!alive(child), 'nothing is left holding the port')
+    } finally { killQuietly(pid); killQuietly(child) }
+})
+
 test('show-env prints the connection strings for the backend', () => {
     const dir = project()
     const r = local(['show-env'], { cwd: dir })

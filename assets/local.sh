@@ -414,11 +414,30 @@ app_pid() {
   printf '%s' "$pid"
 }
 
-# only ever call this with a pid app_pid vouched for
-kill_tree() {
+# every pid under $1, children first
+tree_pids() {
   local c
-  for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done
-  kill "$1" 2>/dev/null || true
+  for c in $(pgrep -P "$1" 2>/dev/null); do tree_pids "$c"; done
+  printf '%s\n' "$1"
+}
+
+# a zombie has exited and only waits for its parent to read the status
+running() { case "$(ps -p "$1" -o stat= 2>/dev/null)" in ''|Z*) return 1 ;; *) return 0 ;; esac; }
+
+# only ever call this with a pid app_pid vouched for
+# a server still shutting down holds its port and the next start would move off it, so stop waits for the whole tree
+kill_tree() {
+  local pids p left
+  pids="$(tree_pids "$1")"
+  for p in $pids; do kill "$p" 2>/dev/null || true; done
+  for _ in $(seq 1 100); do
+    left=""
+    for p in $pids; do running "$p" && left="$left $p"; done
+    [ -z "$left" ] && return 0
+    sleep 0.1
+  done
+  red "still running after 10s, killing:$left"
+  for p in $left; do kill -9 "$p" 2>/dev/null || true; done
 }
 
 publishable_key() {
