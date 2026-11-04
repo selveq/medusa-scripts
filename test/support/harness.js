@@ -111,17 +111,17 @@ const holdAppPort = (dir, app, port) => serveApp(dir, app, port)
 // double-forked so it is reparented to init; a direct child lingers as a zombie
 const LAUNCHER = `
 const { spawn } = require('child_process')
-const [node, pidFile, ...argv] = process.argv.slice(1)
-const child = spawn(node, ['-e', 'setInterval(() => {}, 1000)', '--', ...argv], {
+const [node, pidFile, script, ...argv] = process.argv.slice(1)
+const child = spawn(node, ['-e', script, '--', ...argv], {
     stdio: 'ignore', detached: true,
 })
 child.unref()
 require('fs').writeFileSync(pidFile, String(child.pid))
 `
 
-const daemon = (dir, argv) => {
+const daemon = (dir, argv, script = 'setInterval(() => {}, 1000)') => {
     const pidFile = path.join(dir, `daemon-${argv[0]}-${Date.now?.() ?? 0}.pid`)
-    spawnSync(process.execPath, ['-e', LAUNCHER, '--', process.execPath, pidFile, ...argv], { stdio: 'ignore' })
+    spawnSync(process.execPath, ['-e', LAUNCHER, '--', process.execPath, pidFile, script, ...argv], { stdio: 'ignore' })
     const pid = Number(fs.readFileSync(pidFile, 'utf8'))
     fs.rmSync(pidFile, { force: true })
     return pid

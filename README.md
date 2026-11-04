@@ -73,6 +73,7 @@ Universal SSL covers one subdomain level: `app.example.com` works,
 - Postgres and Redis bind to `127.0.0.1`; nginx routes `/app`, `/admin`, `/auth`, `/store`, `/hooks`, `/health` to the backend, the rest to the storefront.
 - Ports allocate to the closest free one and stay pinned until `--reset`.
 - A recorded pid is checked against the process start time before being signalled.
+- `start` waits for a dev server that is restarting instead of launching a second one.
 - Infra images are pinned by tag and digest in `lib/images.js`; `:latest` warns.
 - Every config value has an `LMA_*` env override.
 

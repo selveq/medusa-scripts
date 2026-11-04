@@ -437,9 +437,13 @@ start_apps() {
     return 0
   fi
   mkdir -p "$LOG_DIR" "$RUN_DIR"
+  local pid
+  # a dev server restarting on a file change is alive with its port closed: a second one would orphan it
   if [ -d "$ROOT/$BACKEND_DIR" ]; then
     if port_up "$LMA_BACKEND_PORT"; then
       note "backend:    already running on :$LMA_BACKEND_PORT"
+    elif pid="$(app_pid backend)"; then
+      note "backend:    already running as pid $pid, its port is closed for now"
     else
       note "backend:    starting dev server"
       (
@@ -463,6 +467,8 @@ start_apps() {
   if [ -d "$ROOT/$STOREFRONT_DIR" ]; then
     if port_up "$LMA_STOREFRONT_PORT"; then
       note "storefront: already running on :$LMA_STOREFRONT_PORT"
+    elif pid="$(app_pid storefront)"; then
+      note "storefront: already running as pid $pid, its port is closed for now"
     else
       key=""
       if [ ! -f "$ROOT/$STOREFRONT_DIR/.env" ]; then
