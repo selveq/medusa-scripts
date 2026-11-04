@@ -550,6 +550,24 @@ stop_apps() {
   done
 }
 
+moved_port() { # $1 = name, $2 = port in use, $3 = allocated, $4 = preferred
+  [ -n "$3" ] && [ "$3" != "$4" ] && [ "$2" = "$3" ] || return 1
+  red "$1 is on :$2, not its preferred :$4, which was busy"
+}
+
+# an allocation stays pinned, so this repeats until it is dealt with
+warn_moved_ports() {
+  local moved=""
+  moved_port postgres "$LMA_PG_PORT" "${_P_POSTGRES:-}" "$_C_PG_PORT" && moved=1
+  moved_port redis "$LMA_REDIS_PORT" "${_P_REDIS:-}" "$_C_REDIS_PORT" && moved=1
+  moved_port proxy "$LMA_HTTP_PORT" "${_P_HTTP:-}" "$_C_HTTP_PORT" && moved=1
+  [ -d "$ROOT/$BACKEND_DIR" ] && moved_port backend "$LMA_BACKEND_PORT" "${_P_BACKEND:-}" "$_C_BACKEND_PORT" && moved=1
+  [ -d "$ROOT/$STOREFRONT_DIR" ] && moved_port storefront "$LMA_STOREFRONT_PORT" "${_P_STOREFRONT:-}" "$_C_STOREFRONT_PORT" && moved=1
+  [ -z "$moved" ] && return 0
+  dim "  anything naming the old port, such as $BACKEND_DIR/.env, now misses it or reaches another project"
+  dim "  once the port is free: lma ports --reset. to keep the new one, set it in the lma config"
+}
+
 drop_and_recreate_db() {
   if [ "$DRY_RUN" = "1" ]; then
     plan "DROP DATABASE \"$LMA_DB_NAME\" and recreate it empty (owner $LMA_DB_USER)"
@@ -591,6 +609,7 @@ esac
 case "$cmd" in
   start|up)
     [ "$DRY_RUN" = "1" ] || need_docker
+    warn_moved_ports
     run "${COMPOSE[@]}" up -d
     [ "$DRY_RUN" = "1" ] || wait_healthy
     note "postgres:   localhost:$LMA_PG_PORT/$LMA_DB_NAME  (url: lma show-env)"
@@ -614,6 +633,7 @@ case "$cmd" in
     ;;
   restart)
     [ "$DRY_RUN" = "1" ] || need_docker
+    warn_moved_ports
     stop_apps
     run "${COMPOSE[@]}" down
     run "${COMPOSE[@]}" up -d

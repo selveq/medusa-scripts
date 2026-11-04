@@ -2,6 +2,7 @@
 const test = require('node:test')
 const assert = require('node:assert')
 const fs = require('node:fs')
+const net = require('node:net')
 const path = require('node:path')
 const images = require('../lib/images.js')
 const { project, cleanup, local, ranDocker, composeImages, daemon, alive, killQuietly, started, sleep, devRuns, PORTS } = require('./support/harness.js')
@@ -178,6 +179,80 @@ test('stop ends a child that ignores SIGTERM after its parent has exited', () =>
         for (let i = 0; alive(child) && i < 50; i++) sleep(100)
         assert.ok(!alive(child), 'nothing is left holding the port')
     } finally { killQuietly(pid); killQuietly(child) }
+})
+
+// a stranger on the port: the allocator moves off it
+const holdPort = async (port) => {
+    const srv = net.createServer()
+    await new Promise((res) => srv.listen(port, '127.0.0.1', res))
+    return () => new Promise((res) => srv.close(res))
+}
+
+const movedLine = (name, port) => new RegExp(`${name} is on :${port + 1}, not its preferred :${port}`)
+
+test('start says a port moved, since a hardcoded .env now reaches something else', async () => {
+    const dir = project()
+    const release = await holdPort(PORTS.postgres)
+    try {
+        const r = local(['start'], { cwd: dir })
+        assert.strictEqual(r.status, 0, r.out)
+        assert.match(r.out, movedLine('postgres', PORTS.postgres))
+        assert.match(r.out, /apps\/backend\/\.env/)
+        assert.match(r.out, /lma ports --reset/)
+    } finally { await release() }
+})
+
+test('restart says a port moved too', async () => {
+    const dir = project()
+    const release = await holdPort(PORTS.redis)
+    try {
+        const r = local(['restart'], { cwd: dir })
+        assert.strictEqual(r.status, 0, r.out)
+        assert.match(r.out, movedLine('redis', PORTS.redis))
+    } finally { await release() }
+})
+
+test('start keeps saying so while the moved port stays pinned after the stranger left', async () => {
+    const dir = project()
+    const release = await holdPort(PORTS.http)
+    local(['start'], { cwd: dir })
+    await release()
+    const r = local(['start'], { cwd: dir })
+    assert.match(r.out, movedLine('proxy', PORTS.http))
+})
+
+test('start says an app moved', async () => {
+    const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    const release = await holdPort(PORTS.backend)
+    try {
+        const r = local(['start'], { cwd: dir })
+        assert.match(r.out, movedLine('backend', PORTS.backend))
+    } finally { await release() }
+})
+
+test('start says nothing about ports when none moved', () => {
+    const r = local(['start'], { cwd: project() })
+    assert.strictEqual(r.status, 0, r.out)
+    assert.doesNotMatch(r.out, /preferred|ports --reset/)
+})
+
+test('a port moved for an app that does not exist stays quiet', async () => {
+    const dir = project()
+    const release = await holdPort(PORTS.storefront)
+    try {
+        const r = local(['start'], { cwd: dir })
+        assert.doesNotMatch(r.out, /preferred|ports --reset/)
+    } finally { await release() }
+})
+
+test('a port set in the environment is a choice, not a move', async () => {
+    const dir = project()
+    const release = await holdPort(PORTS.postgres)
+    try {
+        const r = local(['start'], { cwd: dir, env: { LMA_PG_PORT: String(PORTS.postgres + 5) } })
+        assert.doesNotMatch(r.out, /preferred|ports --reset/)
+    } finally { await release() }
 })
 
 test('show-env prints the connection strings for the backend', () => {
