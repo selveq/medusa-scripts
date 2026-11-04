@@ -74,6 +74,7 @@ Universal SSL covers one subdomain level: `app.example.com` works,
 - Ports allocate to the closest free one and stay pinned until `--reset`.
 - A recorded pid is checked against the process start time before being signalled.
 - `start` waits for a dev server that is restarting instead of launching a second one.
+- `stop` waits up to 10 s for each dev server and its children to exit, then kills what is left.
 - Infra images are pinned by tag and digest in `lib/images.js`; `:latest` warns.
 - Every config value has an `LMA_*` env override.
 
