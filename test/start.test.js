@@ -4,7 +4,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const path = require('node:path')
 const images = require('../lib/images.js')
-const { project, cleanup, local, ranDocker, composeImages, daemon, alive, killQuietly, started, sleep, PORTS } = require('./support/harness.js')
+const { project, cleanup, local, ranDocker, composeImages, daemon, alive, killQuietly, started, sleep, devRuns, PORTS } = require('./support/harness.js')
 
 test.after(cleanup)
 
@@ -97,6 +97,45 @@ test('stop does kill the process whose recorded identity still matches', () => {
         for (let i = 0; alive(pid) && i < 50; i++) sleep(100)
         assert.ok(!alive(pid), 'the real thing must still be stopped')
     } finally { killQuietly(pid) }
+})
+
+const record = (dir, app, pid) => {
+    const run = path.join(dir, '.local-medusa-app', 'run')
+    fs.mkdirSync(run, { recursive: true })
+    fs.writeFileSync(path.join(run, `${app}.pid`), `${pid}\n`)
+    fs.writeFileSync(path.join(run, `${app}.id`), started(pid))
+    return path.join(run, `${app}.pid`)
+}
+
+// what a dev server does when it restarts on a file change: alive, port closed for a moment
+const restarting = (port) =>
+    `setTimeout(() => require('http').createServer().listen(${port}, '127.0.0.1'), 1500)`
+
+for (const app of ['backend', 'storefront']) {
+    test(`start waits for a ${app} that is restarting instead of launching a second one`, () => {
+        const dir = project()
+        fs.mkdirSync(path.join(dir, 'apps', app), { recursive: true })
+        const pid = daemon(dir, [`pretend-${app}`], restarting(PORTS[app]))
+        try {
+            const file = record(dir, app, pid)
+            const r = local(['start'], { cwd: dir })
+            assert.strictEqual(r.status, 0, r.out)
+            assert.deepStrictEqual(devRuns(dir).filter((run) => run.cwd.endsWith(app)), [])
+            assert.strictEqual(fs.readFileSync(file, 'utf8').trim(), String(pid), 'the record still names the first server')
+            assert.match(r.out, new RegExp(`${app} up on :${PORTS[app]}`))
+        } finally { killQuietly(pid) }
+    })
+}
+
+test('start still launches a dev server when the recorded one is gone', () => {
+    const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    const pid = daemon(dir, ['pretend-backend'])
+    record(dir, 'backend', pid)
+    killQuietly(pid)
+    for (let i = 0; alive(pid) && i < 50; i++) sleep(100)
+    const r = local(['start'], { cwd: dir })
+    assert.strictEqual(devRuns(dir).filter((run) => run.cwd.endsWith('backend')).length, 1, r.out)
 })
 
 test('show-env prints the connection strings for the backend', () => {
