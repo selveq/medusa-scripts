@@ -4,11 +4,12 @@ const assert = require('node:assert')
 const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
+const paths = require('../lib/paths.js')
 const { project, cleanup, local, ranDocker, started } = require('./support/harness.js')
 
 test.after(cleanup)
 
-const lockDir = (dir) => path.join(dir, '.local-medusa-app', 'lock')
+const lockDir = (dir) => paths.sub(dir, 'lock')
 
 const holdLock = (dir, pid, cmd = 'start', id = started(pid)) => {
     fs.mkdirSync(lockDir(dir), { recursive: true })

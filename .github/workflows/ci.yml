@@ -61,21 +61,24 @@ jobs:
         run: |
           npx lma init
           test -f lma.js
-          test -f .local-medusa-app/secrets.env
-          test "$(stat -c '%a' .local-medusa-app/secrets.env)" = 600
+          state="$(node -p "require('@selveq/medusa-scripts/lib/paths.js').stateDir('.')")"
+          echo "STATE=$state" >> "$GITHUB_ENV"
+          test -f "$state/secrets.env"
+          test "$(stat -c '%a' "$state/secrets.env")" = 600
+          test "$(stat -c '%a' "$state")" = 700
+          # state stays out of the project, where the admin's dev server would serve it
+          test ! -e .local-medusa-app
           # the config must never ship a shared default password
           ! grep -q medusa123 lma.js
 
-      - name: Dry runs change nothing
+      - name: Dry runs start nothing
         working-directory: /tmp/scratch
         run: |
           npx lma start --dry-run
           npx lma destroy --dry-run
           npx lma reset-db --dry-run
           test -z "$(docker ps -aq)"
-          # the split: durable state at the root, regenerable state in node_modules
-          test -f .local-medusa-app/secrets.env
-          test -f node_modules/.local-medusa-app-cache/ports.json
+          test ! -e node_modules/.local-medusa-app-cache/ports.json
 
       - name: Start the stack for real
         working-directory: /tmp/scratch
@@ -89,23 +92,25 @@ jobs:
             for (const s of ["postgres", "redis", "proxy"]) console.log(images.pinned(s))
           ' > /tmp/pinned.txt
           cat /tmp/pinned.txt
+          # by tag and digest: an image pulled by digest carries no tag of its own
           while read -r ref; do
-            docker image inspect "${ref%@*}" >/dev/null || { echo "missing $ref"; exit 1; }
+            docker image inspect "$ref" >/dev/null || { echo "missing $ref"; exit 1; }
           done < /tmp/pinned.txt
 
-      - name: Postgres and Redis answer, and only on loopback
+      - name: Everything answers, and only on loopback
         working-directory: /tmp/scratch
         run: |
           npx lma status
           npx lma psql -c 'select 1'
-          docker port "$(docker ps --filter name=-postgres --format '{{.Names}}')" | tee /tmp/pg-ports
-          grep -q '127.0.0.1' /tmp/pg-ports
+          docker ps --format '{{.Names}} {{.Ports}}' | tee /tmp/ports
+          test "$(wc -l < /tmp/ports)" = 3
+          ! grep -E '0\.0\.0\.0|:::' /tmp/ports
 
       - name: Dump and reset round-trip
         working-directory: /tmp/scratch
         run: |
           npx lma dump-db
-          ls .local-medusa-app/dumps/*.sql.gz
+          ls "$STATE"/dumps/*.sql.gz
           npx lma reset-db --yes
 
       - name: A destructive command refuses without a tty
@@ -116,5 +121,42 @@ jobs:
 
       - name: Tear it all down
         working-directory: /tmp/scratch
+        if: always()
+        run: npx lma destroy --yes
+
+  # The whole of lma init with the real installer, npm and Medusa, in a path that breaks careless quoting.
+  init:
+    name: lma init with the real Medusa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Pack the package
+        run: echo "TARBALL=$GITHUB_WORKSPACE/$(npm pack --silent)" >> "$GITHUB_ENV"
+
+      - name: Install a store
+        run: |
+          mkdir -p "/tmp/my shop"
+          cd "/tmp/my shop"
+          LMA_TEST_SELF_SPEC="$TARBALL" npx --yes --package="$TARBALL" medusa-scripts init --backend api --store web --yes
+
+      - name: It answers, and it does not hand out its secrets
+        working-directory: /tmp/my shop
+        run: |
+          npx lma status
+          port="$(node -p "require('./lma.js').apps.api.port")"
+          curl -fsS "http://localhost:$port/health"
+          state="$(node -p "require('@selveq/medusa-scripts/lib/paths.js').stateDir('.')")"
+          test -f "$state/secrets.env"
+          test ! -e .local-medusa-app
+          # the dev server serves files inside the project, and this one is outside it
+          code="$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$port/app/@fs$state/secrets.env")"
+          test "$code" = 403
+
+      - name: Tear it down
+        working-directory: /tmp/my shop
         if: always()
         run: npx lma destroy --yes

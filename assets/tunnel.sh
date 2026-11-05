@@ -43,7 +43,8 @@ read_config() {
   const lib = require(process.argv[3]);
   const secrets = require(process.argv[4]);
   const c = cfg.load(root);
-  const { ports } = await lib.resolve(root);
+  const ap = cfg.apps(c);
+  const { ports } = await lib.resolve(root, { frozen: true });
   const t = c.tunnel || {};
   const hosts = t.hostnames || {};
   const rows = [];
@@ -58,8 +59,13 @@ read_config() {
     `_T_CFG_NAME=${q(require("node:path").basename(cfg.configPath(root)))}`,
     `_T_NAME=${q(t.name || cfg.project(root, c))}`,
     `_T_METRICS_PORT=${q(t.metricsPort || 20000 + (lib.projectId(root, c) % 10000))}`,
-    `_T_BACKEND_PORT=${q(ports.backend || "")}`,
-    `_T_ADMIN_WEAK=${q(secrets.isWeak(admin) ? 1 : 0)}`,
+    `_T_BACKEND_NAME=${q(ap.backend.name)}`,
+    `_T_STORE_NAME=${q(ap.store.name)}`,
+    `_T_BACKEND_PORT=${q(ports[ap.backend.name] || "")}`,
+    `_T_ADMIN_WEAK=${q(secrets.isWeak(admin) || require("node:fs").existsSync(require("node:path").join(require("node:path").dirname(sec.file), "seeded-weak")) ? 1 : 0)}`,
+    `_T_ADMIN_IN_CONFIG=${q((c.admin || {}).password ? 1 : 0)}`,
+    `_T_WEAK_SECRETS=${q(secrets.weakAppSecrets(root, ap.backend.dir).join(" "))}`,
+    `_T_BACKEND_DIR=${q(ap.backend.dir)}`,
     `_T_APPS=${q(rows.join("\n"))}`,
   ].join("\n") + "\n");
 })().catch((e) => { console.error(e.message); process.exit(1) })
@@ -194,7 +200,7 @@ port_up() { (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1; }
 our_cloudflared() { # $1 = pid
     local cmd
     cmd="$(ps -p "$1" -o command= 2>/dev/null || true)"
-    case "$cmd" in *cloudflared*) ;; *) return 1 ;; esac
+    case "$cmd" in *"cloudflared tunnel "*) ;; *) return 1 ;; esac
     case "$cmd" in *"$METRICS_ADDR"*) return 0 ;; *) return 1 ;; esac
 }
 
@@ -234,7 +240,7 @@ exposes_backend() { # $1 = mode, $2... = selection
     while IFS=$'\t' read -r app port public; do
         [ -n "$app" ] || continue
         selected_has "$app" "$@" || continue
-        [ "$app" = "backend" ] && return 0
+        [ "$app" = "$_T_BACKEND_NAME" ] && return 0
     done < <(mode_map "$mode")
     return 1
 }
@@ -264,11 +270,14 @@ exposure_banner() { # $1 = mode, $2... = selection
         else
             printf '  https://%s → localhost:%s %s(%s)%s\n' "$public" "$port" "$dim" "$app" "$off"
         fi
-        if [ "$app" = "backend" ]; then
+        if [ "$app" = "$_T_BACKEND_NAME" ]; then
             printf '    %sincludes the Admin dashboard at /app, /auth and every store route%s\n' "$yellow" "$off"
         fi
     done < <(mode_map "$mode")
     printf '  %sthe database and credentials behind them go too: development data only.%s\n' "$dim" "$off"
+    if exposes_backend "$mode" "$@"; then
+        printf '  %sthe dev server also serves project source files, and lma cannot check admins it did not create.%s\n' "$dim" "$off"
+    fi
     info ""
 }
 
@@ -276,9 +285,19 @@ exposure_gate() { # $1 = mode, $2... = selection
     local mode="$1"; shift
     exposure_banner "$mode" "$@"
 
-    if [ "$_T_ADMIN_WEAK" = "1" ] && exposes_backend "$mode" "$@" && [ "${LMA_TUNNEL_ALLOW_WEAK_ADMIN:-0}" != "1" ]; then
-        die "the admin password is guessable and this publishes the Admin dashboard.
-  Drop admin.password for a generated one, re-run 'lma seed-admin', or set LMA_TUNNEL_ALLOW_WEAK_ADMIN=1."
+    if exposes_backend "$mode" "$@" && [ "${LMA_TUNNEL_ALLOW_WEAK_ADMIN:-0}" != "1" ]; then
+        if [ -n "$_T_WEAK_SECRETS" ]; then
+            die "$_T_BACKEND_DIR/.env: $_T_WEAK_SECRETS is missing or a public default, so anyone could forge an admin login on the published backend.
+  Put a real one in that file (openssl rand -hex 32) and run lma restart, or set LMA_TUNNEL_ALLOW_WEAK_ADMIN=1."
+        fi
+        if [ "$_T_ADMIN_WEAK" = "1" ]; then
+            die "the admin password is guessable and this publishes the Admin dashboard.
+  An account keeps the password it was created with: start over with lma reset-db and lma migrate if the data is disposable, or change it through Medusa's password reset, then delete $_T_STATE_DIR/seeded-weak. Or set LMA_TUNNEL_ALLOW_WEAK_ADMIN=1."
+        fi
+        if [ "$_T_ADMIN_IN_CONFIG" = "1" ]; then
+            die "admin.password is in $_T_CFG_NAME, and the published dev server serves that file to anyone who asks.
+  Drop it for a generated one, or set LMA_TUNNEL_ALLOW_WEAK_ADMIN=1."
+        fi
     fi
 
     local key ans
@@ -326,11 +345,13 @@ launch() {
     mkdir -p "$TUNNEL_DIR"
     : > "$LOG_FILE"
     nohup cloudflared "$@" >> "$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
+    LAUNCHED=$!
+    echo "$LAUNCHED" > "$PID_FILE"
 }
 
+# our own child, so the pid is nobody else's; until it has exec'd its command line still reads as this script
 abort_if_dead() {
-    tunnel_pid >/dev/null && return 0
+    kill -0 "$LAUNCHED" 2>/dev/null && return 0
     warn "cloudflared exited during startup. Last lines:"
     tail -n 15 "$LOG_FILE" >&2
     rm -f "$PID_FILE" "$MODE_FILE" "$URL_FILE"
@@ -349,7 +370,9 @@ wait_ready() {
 }
 
 tunnel_uuid() {
-    cloudflared tunnel list 2>/dev/null | awk -v n="$1" '$2 == n { print $1; exit }'
+    local list
+    list="$(cloudflared tunnel list 2>&1)" || { warn "cloudflared tunnel list failed: $(printf '%s' "$list" | tail -1)"; return 1; }
+    awk -v n="$1" '$2 == n { print $1; exit }' <<<"$list"
 }
 
 write_config() {
@@ -406,14 +429,14 @@ cors_check() { # $@ = selection
     local sf_pub be_pub stale=0
     [ -n "$_T_BACKEND_PORT" ] || return 0
     port_up "$_T_BACKEND_PORT" || return 0
-    sf_pub="$(app_map | awk -F'\t' '$1 == "storefront" { print $3 }')"
-    be_pub="$(app_map | awk -F'\t' '$1 == "backend" { print $3 }')"
-    if [ -n "$sf_pub" ] && selected_has "storefront" "$@" &&
+    sf_pub="$(app_map | awk -F'\t' -v a="$_T_STORE_NAME" '$1 == a { print $3 }')"
+    be_pub="$(app_map | awk -F'\t' -v a="$_T_BACKEND_NAME" '$1 == a { print $3 }')"
+    if [ -n "$sf_pub" ] && selected_has "$_T_STORE_NAME" "$@" &&
         ! cors_allowed "https://$sf_pub" "$_T_BACKEND_PORT" /store/regions; then
         warn "the backend rejects Origin https://$sf_pub (STORE_CORS)"
         stale=1
     fi
-    if [ -n "$be_pub" ] && selected_has "backend" "$@" &&
+    if [ -n "$be_pub" ] && selected_has "$_T_BACKEND_NAME" "$@" &&
         ! cors_allowed "https://$be_pub" "$_T_BACKEND_PORT" /admin/users; then
         warn "the backend rejects Origin https://$be_pub (ADMIN_CORS)"
         stale=1
@@ -469,7 +492,7 @@ cmd_setup() {
     local creds="$CREDS_FILE"
     mkdir -p "$CREDS_DIR"
     local uuid
-    uuid="$(tunnel_uuid "$TUNNEL_NAME")"
+    uuid="$(tunnel_uuid "$TUNNEL_NAME")" || die "Could not ask Cloudflare about the tunnel; are you online and logged in?"
     if [ -n "$uuid" ]; then
         ok "Reusing existing tunnel '$TUNNEL_NAME' ($uuid)"
         if [ ! -f "$creds" ]; then
@@ -487,7 +510,7 @@ cmd_setup() {
         info "Creating tunnel '$TUNNEL_NAME'..."
         cloudflared tunnel create --credentials-file "$creds" "$TUNNEL_NAME" \
             || die "Could not create tunnel '$TUNNEL_NAME'."
-        uuid="$(tunnel_uuid "$TUNNEL_NAME")"
+        uuid="$(tunnel_uuid "$TUNNEL_NAME")" || uuid=""
         [ -n "$uuid" ] || die "Tunnel created but its UUID could not be read back."
         ok "Created tunnel '$TUNNEL_NAME' ($uuid)"
     fi
@@ -536,7 +559,7 @@ cmd_start() {
     exposure_gate named "$@"
 
     local uuid
-    uuid="$(tunnel_uuid "$TUNNEL_NAME")"
+    uuid="$(tunnel_uuid "$TUNNEL_NAME")" || die "Could not ask Cloudflare about the tunnel; are you online and logged in?"
     [ -n "$uuid" ] || die "Tunnel '$TUNNEL_NAME' not found. Run: lma tunnel setup"
     write_config "$uuid" "$CREDS_FILE" "$@"
 
@@ -556,7 +579,7 @@ cmd_start() {
 
     local port public
     while IFS=$'\t' read -r app port public; do
-        [ "$app" = "backend" ] || continue
+        [ "$app" = "$_T_BACKEND_NAME" ] || continue
         selected_has "$app" "$@" || continue
         check_admin_hosts "$public" "$port" ||
             warn "  the backend started before that hostname was in the config; pick it up with: lma restart"
@@ -565,7 +588,7 @@ cmd_start() {
 
 # throwaway trycloudflare URL, no account needed
 cmd_quick() {
-    local app="${1:-storefront}" port
+    local app="${1:-$_T_STORE_NAME}" port
     port="$(app_port "$app")"
     [ -n "$port" ] || die "Unknown app '$app'. Defined: $(app_map | cut -f1 | tr '\n' ' ')"
 
@@ -606,25 +629,31 @@ cmd_quick() {
 
     wait_ready || warn "URL assigned, but edge connections are still registering."
     report_up
-    if [ "$app" = "storefront" ]; then
+    if [ "$app" = "$_T_STORE_NAME" ]; then
         warn "quick URL is not in backend CORS; browser API calls may fail; prefer: lma tunnel start"
     fi
-    if [ "$app" = "backend" ]; then
+    if [ "$app" = "$_T_BACKEND_NAME" ]; then
         check_admin_hosts "${url#https://}" "$port" ||
             warn "  a throwaway hostname cannot be allowed in advance; for the admin use: lma tunnel start backend"
     fi
 }
 
+# lma stop passes this: a uuid is shared by every checkout under one tunnel name, and only this folder's stack is stopping
+THIS_FOLDER_ONLY=0
+
 # every cloudflared for this project: a stale pid file must not hide a live one
+# the words after the name matter: tail -f on the tunnel log also says cloudflared and this folder
 project_tunnel_pids() {
-    local uuid pid cmd
-    uuid="$(tunnel_uuid "$TUNNEL_NAME" 2>/dev/null || true)"
+    local uuid="" asked=0 pid cmd
     for pid in $(pgrep -f cloudflared 2>/dev/null || true); do
         cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-        case "$cmd" in *cloudflared*) ;; *) continue ;; esac
+        case "$cmd" in *"cloudflared tunnel "*) ;; *) continue ;; esac
         case "$cmd" in
             *"$CONFIG_FILE"*|*"$METRICS_ADDR"*|*"$TUNNEL_DIR"*) printf '%s\n' "$pid"; continue ;;
         esac
+        [ "$THIS_FOLDER_ONLY" = "1" ] && continue
+        # only a stranger's tunnel is worth a call to Cloudflare, and with none running stop stays instant
+        if [ "$asked" = "0" ]; then uuid="$(tunnel_uuid "$TUNNEL_NAME" 2>/dev/null || true)"; asked=1; fi
         [ -n "$uuid" ] || continue
         case "$cmd" in *"$uuid"*) printf '%s\n' "$pid" ;; esac
     done
@@ -671,8 +700,11 @@ cmd_status() {
     local pid mode running=0 app port public
     mode="$(tunnel_mode)"
     if pid="$(tunnel_pid)"; then
-        ok "Running (pid $pid, $mode) — ${yellow}published to the internet${off}"
+        ok "Running (pid $pid, $mode), ${yellow}published to the internet${off}"
         running=1
+        if [ -n "$_T_WEAK_SECRETS" ]; then
+            warn "$_T_BACKEND_DIR/.env: $_T_WEAK_SECRETS is missing or a public default, so anyone could forge an admin login if the backend is published"
+        fi
         [ "$mode" = "quick" ] && info "  ${bold}$(cat "$URL_FILE" 2>/dev/null)${off} ${dim}($(cat "$ACTIVE_FILE" 2>/dev/null))${off}"
     else
         local orphans
@@ -722,7 +754,8 @@ case "$sub" in
     setup)   cmd_setup "$@" ;;
     quick)   cmd_quick "$@" ;;
     start)   cmd_start "$@" ;;
-    stop)    cmd_stop "$@" ;;
+    stop)    [ "${1:-}" = "--this-folder" ] && THIS_FOLDER_ONLY=1
+             cmd_stop ;;
     restart) restart_mode="$(tunnel_mode)"
              restart_selection=""
              [ -f "$ACTIVE_FILE" ] && restart_selection="$(cat "$ACTIVE_FILE")"

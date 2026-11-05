@@ -2,6 +2,7 @@
 // Stand-in for npm: records the environment the dev server would have been
 // started with, so tests can assert on what lma injects.
 const fs = require('node:fs')
+const net = require('node:net')
 
 const argv = process.argv.slice(2)
 const log = process.env.LMA_TEST_NPM_LOG
@@ -12,6 +13,18 @@ if (log) {
             keep[k] = v
         }
     }
-    fs.appendFileSync(log, JSON.stringify({ argv, cwd: process.cwd(), env: keep }) + '\n')
+    fs.appendFileSync(log, JSON.stringify({ argv, cwd: process.cwd(), env: keep, at: process.hrtime.bigint().toString() }) + '\n')
 }
-process.exit(0)
+
+// a dev server that answers lma's first look and leaves, so the next test finds the port free
+if (argv[0] === 'run' && argv[1] === 'dev' && !process.env.LMA_TEST_DEV_CRASH) {
+    setTimeout(() => process.exit(0), 20_000)
+    if (!process.env.LMA_TEST_DEV_NO_PORT) {
+        const server = net.createServer(() => process.exit(0))
+        server.on('error', () => process.exit(1))
+        server.listen(Number(process.env.PORT), '127.0.0.1')
+    }
+    return
+}
+if (argv[0] === 'view') process.stdout.write(`${process.env.LMA_TEST_MEDUSA_LATEST || '9.9.9'}\n`)
+process.exit(Number((argv[0] === 'install' && process.env.LMA_TEST_NPM_INSTALL_EXIT) || 0))

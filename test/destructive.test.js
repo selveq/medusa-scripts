@@ -3,7 +3,8 @@ const test = require('node:test')
 const assert = require('node:assert')
 const fs = require('node:fs')
 const path = require('node:path')
-const { project, cleanup, local, ranDocker, dockerCalls } = require('./support/harness.js')
+const paths = require('../lib/paths.js')
+const { project, cleanup, local, cli, onTerminal, ranDocker, dockerCalls } = require('./support/harness.js')
 
 test.after(cleanup)
 
@@ -20,6 +21,36 @@ test('destroy takes the wrong confirmation word as no', () => {
     const r = local(['destroy'], { cwd: dir, input: 'yes\n' })
     assert.notStrictEqual(r.status, 0)
     assert.ok(!ranDocker(dir, 'compose', 'down'))
+})
+
+test('on a terminal, destroy takes only the exact word', () => {
+    const dir = project()
+    const wrong = onTerminal(['destroy'], { cwd: dir, lines: ['yes'] })
+    assert.notStrictEqual(wrong.status, 0, wrong.out)
+    assert.match(wrong.out, /aborted/)
+    assert.ok(!ranDocker(dir, 'compose', 'down'), 'a wrong word deletes nothing')
+    const right = onTerminal(['destroy'], { cwd: dir, lines: ['destroy'] })
+    assert.strictEqual(right.status, 0, right.out)
+    assert.ok(ranDocker(dir, 'compose', 'down', '-v'))
+})
+
+test('import-db takes a relative path from where the user stands', () => {
+    const dir = project()
+    const sub = path.join(dir, 'sub')
+    fs.mkdirSync(sub)
+    fs.writeFileSync(path.join(dir, 'dump.sql'), 'select 1 /* the root copy */;')
+    fs.writeFileSync(path.join(sub, 'dump.sql'), 'select 2 /* the one meant */;')
+    const r = cli(['import-db', 'dump.sql', '--yes'], { cwd: sub })
+    assert.strictEqual(r.status, 0, r.out)
+    assert.match(r.out, new RegExp(`importing ${path.join(sub, 'dump.sql').replace(/[/.]/g, '\\$&')}`))
+})
+
+test('dump-db writes a relative path where the user stands', () => {
+    const dir = project()
+    const sub = path.join(dir, 'sub')
+    fs.mkdirSync(sub)
+    assert.strictEqual(cli(['dump-db', 'mine.sql.gz'], { cwd: sub }).status, 0)
+    assert.ok(fs.existsSync(path.join(sub, 'mine.sql.gz')))
 })
 
 test('destroy --yes removes containers and volumes', () => {
@@ -123,7 +154,7 @@ test('an import that hits errors says so and keeps the log', () => {
     assert.notStrictEqual(r.status, 0, 'a partial restore must not report success')
     assert.match(r.out, /import completed with 7 error\(s\); the database may be incomplete/)
     assert.match(r.out, /\.\.\. and 2 more/, 'the first five, then a pointer to the log')
-    const log = path.join(dir, '.local-medusa-app', 'last-import.log')
+    const log = paths.sub(dir, 'last-import.log')
     assert.match(fs.readFileSync(log, 'utf8'), /ERROR:/, 'the log survives for diagnosis')
 })
 
@@ -132,7 +163,7 @@ test('a clean import leaves no log behind', () => {
     const dump = path.join(dir, 'dump.sql')
     fs.writeFileSync(dump, 'SELECT 1;\n')
     local(['db:import', dump, '--yes'], { cwd: dir, env: { LMA_TEST_DB_TABLES: '7' } })
-    assert.ok(!fs.existsSync(path.join(dir, '.local-medusa-app', 'last-import.log')))
+    assert.ok(!fs.existsSync(paths.sub(dir, 'last-import.log')))
 })
 
 test('stop keeps the volumes', () => {
@@ -148,7 +179,7 @@ test('dump-db --dry-run writes no file', () => {
     const r = local(['db:dump', '--dry-run'], { cwd: dir })
     assert.strictEqual(r.status, 0, r.out)
     assert.match(r.out, /\[dry-run\] pg_dump/)
-    assert.ok(!fs.existsSync(path.join(dir, '.local-medusa-app', 'dumps')), 'no dump directory on a dry run')
+    assert.ok(!fs.existsSync(paths.sub(dir, 'dumps')), 'no dump directory on a dry run')
 })
 
 const dropRan = (dir) =>
