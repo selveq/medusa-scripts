@@ -13,8 +13,12 @@ const flag = (name) => {
 }
 
 if (argv[0] === 'tunnel' && argv[1] === 'list') {
+    if (process.env.LMA_TEST_TUNNEL_LIST_FAILS) {
+        process.stderr.write('failed to reach the edge: certificate not valid\n')
+        process.exit(1)
+    }
     process.stdout.write('ID NAME CREATED CONNECTIONS\n')
-    process.stdout.write(`11111111-2222-3333-4444-555555555555 ${process.env.LMA_TEST_TUNNEL_NAME || 'demo'} 2026-01-01 0\n`)
+    process.stdout.write(`${process.env.LMA_TEST_TUNNEL_UUID || '11111111-2222-3333-4444-555555555555'} ${process.env.LMA_TEST_TUNNEL_NAME || 'demo'} 2026-01-01 0\n`)
     process.exit(0)
 }
 

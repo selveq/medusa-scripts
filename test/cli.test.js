@@ -4,6 +4,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const paths = require('../lib/paths.js')
 const { cli, cleanup } = require('./support/harness.js')
 
 const roots = []
@@ -34,25 +35,67 @@ test('a command outside a project explains what to do', () => {
     assert.match(r.out, /Run 'lma init' in your project root first/)
 })
 
-test('init scaffolds a config, the state dir and one npm alias', () => {
+test('init scaffolds a config, the state folder and one npm alias', () => {
     const dir = blank()
     const r = cli(['init'], { cwd: dir })
     assert.strictEqual(r.status, 0, r.out)
     assert.ok(fs.existsSync(path.join(dir, 'lma.js')))
-    assert.ok(fs.existsSync(path.join(dir, '.local-medusa-app', '.gitignore')))
+    assert.ok(fs.existsSync(paths.sub(dir, 'secrets.env')))
     assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).scripts.lma, 'lma')
 })
 
-test('init ships no password in the config and prints a generated one', () => {
+test('init ships no password in the config and prints none', () => {
     const dir = blank()
     const r = cli(['init'], { cwd: dir })
     const config = fs.readFileSync(path.join(dir, 'lma.js'), 'utf8')
     assert.ok(!/medusa123/.test(config), 'the old shared default must be gone')
     assert.ok(!/password:\s*'[^']+'/.test(config.split('admin:')[1].split('},')[0]), 'admin block ships no password')
-    const printed = r.out.match(/Admin login \(generated, local only\): \S+ \/ (\S+)/)
-    assert.ok(printed, `expected the generated login in:\n${r.out}`)
-    const secrets = fs.readFileSync(path.join(dir, '.local-medusa-app', 'secrets.env'), 'utf8')
-    assert.ok(secrets.includes(printed[1]), 'the printed password is the stored one')
+    assert.match(r.out, /lma admin prints it/)
+    const stored = fs.readFileSync(paths.sub(dir, 'secrets.env'), 'utf8').match(/LMA_ADMIN_PASSWORD='(.+)'/)[1]
+    assert.ok(!r.out.includes(stored), 'a log is no place for it')
+})
+
+test('run through npx, init names the install it still needs, never the unrelated lma package', () => {
+    const dir = blank()
+    const r = cli(['init'], { cwd: dir })
+    assert.match(r.out, /Next: npm i -D @selveq\/medusa-scripts/)
+    const none = blank()
+    const bare = cli(['init', '--no-scripts'], { cwd: none })
+    assert.match(bare.out, /npx @selveq\/medusa-scripts start/)
+    assert.doesNotMatch(bare.out, /npx lma start/)
+})
+
+test('init says why it only wrote the config, on a terminal with a stray file', () => {
+    const dir = blank()
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'x')
+    assert.match(cli(['init'], { cwd: dir }).out, /This folder is not empty \(.*notes\.txt.*\), so lma only writes its config/)
+})
+
+test('init from inside a project refuses to start a second one', () => {
+    const dir = blank()
+    cli(['init'], { cwd: dir })
+    const inner = path.join(dir, 'apps', 'api')
+    fs.mkdirSync(inner, { recursive: true })
+    const r = cli(['init'], { cwd: inner })
+    assert.notStrictEqual(r.status, 0)
+    assert.match(r.out, /is already an lma project and this folder is inside it/)
+    assert.ok(!fs.existsSync(path.join(inner, 'lma.js')))
+})
+
+test('init --help and --dry-run write nothing', () => {
+    for (const flag of ['--help', '-h', '--dry-run', '-n']) {
+        const dir = blank()
+        const before = fs.readdirSync(dir).sort()
+        assert.strictEqual(cli(['init', flag], { cwd: dir }).status, 0, flag)
+        assert.deepStrictEqual(fs.readdirSync(dir).sort(), before, flag)
+    }
+})
+
+test('npx settings given to lma reach no child of it', () => {
+    const dir = blank()
+    cli(['init'], { cwd: dir })
+    const r = cli(['ports', '--json'], { cwd: dir, env: { npm_config_package: 'x', npm_config_call: 'y' } })
+    assert.strictEqual(r.status, 0, r.out)
 })
 
 test('init keeps a config that is already there', () => {

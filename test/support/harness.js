@@ -3,13 +3,20 @@ const { spawn, spawnSync } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const paths = require('../../lib/paths.js')
+
+// lma keeps its state in the home folder, and a test must never touch the real one
+const HOME = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lma-home-')))
+process.env.HOME = HOME
+process.on('exit', () => fs.rmSync(HOME, { recursive: true, force: true }))
 
 const PKG = path.join(__dirname, '..', '..')
 const ASSETS = path.join(PKG, 'assets')
 const FAKE_BIN = path.join(__dirname, 'bin')
 
-// one port band per test process, below every OS ephemeral range (32768+)
-const BASE = 21000 + (process.pid % 100) * 60
+// one port band per test file, below every OS ephemeral range (32768+): the files run at the same time
+const testFiles = fs.readdirSync(path.join(__dirname, '..')).filter((name) => name.endsWith('.test.js')).sort()
+const BASE = 21000 + (testFiles.indexOf(path.basename(process.argv[1] || '')) + 1) * 200
 const PORTS = {
     postgres: BASE,
     redis: BASE + 10,
@@ -39,6 +46,8 @@ const merge = (base, extra) => {
     if (!extra || typeof extra !== 'object' || Array.isArray(extra)) return extra === undefined ? base : extra
     const out = { ...base }
     for (const [k, v] of Object.entries(extra)) {
+        // null takes a default out, which is how a test renames an app
+        if (v === null) { delete out[k]; continue }
         out[k] = v && typeof v === 'object' && !Array.isArray(v) ? merge(base[k] || {}, v) : v
     }
     return out
@@ -98,15 +107,38 @@ const serveApp = (dir, app, port, { allowedHosts = [], allowedOrigins = [] } = {
         { stdio: 'ignore' }
     )
     // the allocator keeps a port whose app is alive, and preflight wants it up
-    fs.mkdirSync(path.join(dir, '.local-medusa-app', 'run'), { recursive: true })
-    fs.writeFileSync(path.join(dir, '.local-medusa-app', 'run', `${app}.pid`), String(child.pid))
+    fs.mkdirSync(paths.sub(dir, 'run'), { recursive: true })
+    fs.writeFileSync(paths.sub(dir, 'run', `${app}.pid`), String(child.pid))
     const deadline = Date.now() + 5000
     while (!fs.existsSync(ready) && Date.now() < deadline) sleepSync(20)
     if (!fs.existsSync(ready)) throw new Error(`fake ${app} never listened on ${port}`)
-    return () => { child.kill('SIGKILL') }
+    // the next test must find the port free, and a killed process holds it a moment longer
+    return () => {
+        child.kill('SIGKILL')
+        const deadline = Date.now() + 2000
+        while (portOpen(port) && Date.now() < deadline) sleepSync(10)
+    }
 }
 
 const holdAppPort = (dir, app, port) => serveApp(dir, app, port)
+
+// lma on a real terminal, typing the lines as it asks
+const onTerminal = (args, { cwd, env = {}, lines = [] } = {}) => {
+    const spec = { argv: [process.execPath, path.join(PKG, 'bin', 'lma.js'), ...args], lines }
+    const r = spawnSync('python3', ['-I', path.join(__dirname, 'pty.py'), JSON.stringify(spec)], {
+        cwd,
+        encoding: 'utf8',
+        env: {
+            ...process.env,
+            PATH: `${FAKE_BIN}${path.delimiter}${process.env.PATH}`,
+            LMA_TEST_DOCKER_LOG: dockerLog(cwd),
+            LMA_TEST_NPM_LOG: path.join(cwd, 'npm.log'),
+            LMA_TEST_NPX_LOG: path.join(cwd, 'npx.log'),
+            ...env,
+        },
+    })
+    return { ...r, out: strip(r.stdout || '') }
+}
 
 // double-forked so it is reparented to init; a direct child lingers as a zombie
 const LAUNCHER = `
@@ -145,6 +177,11 @@ const dockerRuns = (dir) => {
     } catch { return [] }
 }
 
+const dockerAt = (dir, ...words) => {
+    const run = dockerRuns(dir).find((r) => words.every((w) => r.argv.includes(w)))
+    return run ? BigInt(run.at) : null
+}
+
 const dockerCalls = (dir) => dockerRuns(dir).map((r) => r.argv)
 
 const composeImages = (dir) =>
@@ -152,6 +189,18 @@ const composeImages = (dir) =>
 
 const ranDocker = (dir, ...words) =>
     dockerCalls(dir).some((argv) => words.every((w) => argv.includes(w)))
+
+// a stand-in dev server leaves as soon as lma has seen it, and the next test must find its port free
+const portOpen = (port) => spawnSync('bash', ['-c', `exec 3<>/dev/tcp/127.0.0.1/${port}`], { stdio: 'ignore' }).status === 0
+const settle = (cwd, env) => {
+    if (!cwd) return
+    const log = env.LMA_TEST_NPM_LOG || path.join(cwd, 'npm.log')
+    const runs = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : []
+    for (const run of runs) {
+        const deadline = Date.now() + 2000
+        while (run.env.PORT && portOpen(run.env.PORT) && Date.now() < deadline) sleepSync(10)
+    }
+}
 
 const engine = (script, args, { cwd, env = {}, input = '' } = {}) => {
     const r = spawnSync('bash', [path.join(ASSETS, script), ...args], {
@@ -166,15 +215,25 @@ const engine = (script, args, { cwd, env = {}, input = '' } = {}) => {
             LMA_TEST_DOCKER_LOG: dockerLog(cwd),
             LMA_TEST_CLOUDFLARED_LOG: path.join(cwd, 'cloudflared.log'),
             LMA_TEST_NPM_LOG: path.join(cwd, 'npm.log'),
+            LMA_TEST_NPX_LOG: path.join(cwd, 'npx.log'),
+            LMA_TEST_CAFFEINATE_LOG: path.join(cwd, 'caffeinate.log'),
             ...env,
         },
     })
+    settle(cwd, env)
     return { ...r, out: strip((r.stdout || '') + (r.stderr || '')) }
 }
 
 const devRuns = (dir) => {
     try {
         return fs.readFileSync(path.join(dir, 'npm.log'), 'utf8')
+            .trim().split('\n').filter(Boolean).map(JSON.parse)
+    } catch { return [] }
+}
+
+const npxRuns = (dir) => {
+    try {
+        return fs.readFileSync(path.join(dir, 'npx.log'), 'utf8')
             .trim().split('\n').filter(Boolean).map(JSON.parse)
     } catch { return [] }
 }
@@ -200,15 +259,19 @@ const cli = (args, { cwd, env = {} } = {}) => {
             ...process.env,
             PATH: `${FAKE_BIN}${path.delimiter}${process.env.PATH}`,
             LMA_TEST_DOCKER_LOG: dockerLog(cwd),
+            LMA_TEST_NPM_LOG: path.join(cwd, 'npm.log'),
+            LMA_TEST_NPX_LOG: path.join(cwd, 'npx.log'),
+            LMA_TEST_CAFFEINATE_LOG: path.join(cwd, 'caffeinate.log'),
             ...env,
         },
     })
+    settle(cwd, env)
     return { ...r, out: strip((r.stdout || '') + (r.stderr || '')) }
 }
 
 module.exports = {
     PKG, ASSETS, FAKE_BIN, DEFAULTS, PORTS,
     project, cleanup, holdAppPort, serveApp, daemon, alive, killQuietly, started, sleep: sleepSync,
-    local, tunnel, cli,
-    dockerCalls, ranDocker, composeImages, cloudflaredCalls, devRuns, devEnv,
+    local, tunnel, cli, onTerminal,
+    dockerAt, dockerCalls, ranDocker, composeImages, cloudflaredCalls, devRuns, devEnv, npxRuns,
 }

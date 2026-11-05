@@ -9,7 +9,7 @@ if (log) {
     for (const k of ['LMA_POSTGRES_IMAGE', 'LMA_REDIS_IMAGE', 'LMA_PROXY_IMAGE']) {
         if (process.env[k]) images[k] = process.env[k]
     }
-    fs.appendFileSync(log, JSON.stringify({ argv, images }) + '\n')
+    fs.appendFileSync(log, JSON.stringify({ argv, images, at: process.hrtime.bigint().toString() }) + '\n')
 }
 
 const env = (k, d) => (process.env[k] === undefined ? d : process.env[k])
@@ -21,12 +21,18 @@ switch (argv[0]) {
         process.exit(env('LMA_TEST_DOCKER_DOWN', '0') === '1' ? 1 : 0)
         break
     case 'ps':
-        break // no containers of ours are publishing ports
+        if (process.env.LMA_TEST_DOCKER_PS) out(process.env.LMA_TEST_DOCKER_PS)
+        break
+    case 'volume':
+        if (process.env.LMA_TEST_OLD_VOLUMES) out(process.env.LMA_TEST_OLD_VOLUMES)
+        break
     case 'inspect':
         out(env('LMA_TEST_HEALTH', 'healthy'))
         break
     case 'compose':
-        break // recorded above; that is the whole point
+        // the real compose fails with no daemon, and when an image or a port is not to be had
+        if (env('LMA_TEST_DOCKER_DOWN', '0') === '1' || process.env.LMA_TEST_COMPOSE_FAILS) process.exit(1)
+        break
     case 'exec': {
         if (has(/^redis-cli$/)) { out('PONG'); break }
         if (has(/pg_dump|pg_restore/)) break
@@ -47,7 +53,13 @@ switch (argv[0]) {
         }
         if (has(/lower\(email\) <>/)) break
         if (has(/lower\(email\) =/)) { out(env('LMA_TEST_ADMIN_MATCHES', '0')); break }
-        if (has(/FROM "user"/)) { out(env('LMA_TEST_ADMIN_COUNT', '1')); break }
+        if (has(/FROM "user"/)) {
+            // a missing table is an error in real psql, not an empty answer
+            const count = env('LMA_TEST_ADMIN_COUNT', '1')
+            if (count === '') process.exit(1)
+            out(count)
+            break
+        }
         if (has(/api_key/)) { out(env('LMA_TEST_PUBLISHABLE_KEY', 'pk_test')); break }
         break
     }

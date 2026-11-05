@@ -145,3 +145,8 @@ test('show-env prints the effective CORS and says it is automatic', () => {
     assert.match(r.out, /^ADMIN_CORS=.*https:\/\/api\.example\.test$/m)
     assert.match(r.out, /merged with your \.env/)
 })
+
+test('env values read the way dotenv reads them', () => {
+    const parsed = envfile.parse('A="https://x" # note\nB=one\r\nC=x#y\nD=\'q r\'\nE=  spaced value  # c\nexport F=1\nG=\n')
+    assert.deepStrictEqual(parsed, { A: 'https://x', B: 'one', C: 'x', D: 'q r', E: 'spaced value', F: '1', G: '' })
+})

@@ -3,7 +3,9 @@ const test = require('node:test')
 const assert = require('node:assert')
 const fs = require('node:fs')
 const path = require('node:path')
-const { project, cleanup, local } = require('./support/harness.js')
+const paths = require('../lib/paths.js')
+const secrets = require('../lib/secrets.js')
+const { project, cleanup, local, npxRuns, dockerCalls, PORTS } = require('./support/harness.js')
 
 test.after(cleanup)
 
@@ -26,10 +28,10 @@ test('admin says plainly when the configured account does not exist', () => {
 
 test('admin confirms an account lma seeded itself', () => {
     const dir = project()
-    fs.mkdirSync(path.join(dir, '.local-medusa-app'), { recursive: true })
-    fs.writeFileSync(path.join(dir, '.local-medusa-app', 'seeded-admin'), 'admin@demo.local\n')
+    fs.mkdirSync(paths.stateDir(dir), { recursive: true })
+    fs.writeFileSync(paths.sub(dir, 'seeded-admin'), 'admin@demo.local\n')
     const r = local(['admin'], { cwd: dir, env: db(1, 1) })
-    assert.match(r.out, /lma created it with this password/)
+    assert.match(r.out, /lma created it; if its password was changed since, this one no longer works/)
 })
 
 test('admin hedges on an account it did not create', () => {
@@ -65,10 +67,70 @@ test('seed-admin still reports an unmigrated database', () => {
     assert.match(r.out, /no user table yet\. Run: lma migrate/)
 })
 
-test('start does not stop at an unmigrated database', () => {
+test('start does not stop at an unmigrated database when there is no backend to run on it', () => {
     const dir = project()
     const r = local(['start'], { cwd: dir, env: { LMA_TEST_ADMIN_COUNT: '' } })
     assert.strictEqual(r.status, 0, r.out)
+})
+
+test('seed-admin creates the account through Medusa, with its email and password', () => {
+    const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    assert.strictEqual(local(['seed-admin'], { cwd: dir, env: db(0, 0) }).status, 0)
+    const { argv } = npxRuns(dir).find((run) => run.argv.includes('user'))
+    assert.deepStrictEqual(argv.slice(0, 4), ['--no', 'medusa', 'user', '-e'])
+    assert.strictEqual(argv[4], 'admin@demo.local')
+})
+
+test('with node_modules gone, npx may not fetch the unrelated package called medusa', () => {
+    const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    local(['seed-admin'], { cwd: dir, env: db(0, 0) })
+    assert.ok(npxRuns(dir).every((run) => run.argv[0] === '--no'))
+})
+
+test('seeding prints no password when the output may be going into a log', () => {
+    const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    const r = local(['seed-admin'], { cwd: dir, env: db(0, 0) })
+    assert.match(r.out, /admin seeded: admin@demo\.local/)
+    const { LMA_ADMIN_PASSWORD } = secrets.ensure(dir).values
+    assert.ok(!r.out.includes(LMA_ADMIN_PASSWORD))
+})
+
+for (const [why, env, write] of [
+    ['a moved port left in the backend .env', {}, `DATABASE_URL=postgres://medusa:medusa@localhost:${PORTS.postgres + 7}/medusa-backend\n`],
+    ['an export in the shell', { DATABASE_URL: 'postgres://deploy:x@prod.example.com/shop' }, ''],
+]) {
+    test(`migrate and seed-admin refuse a database that is not this stack's: ${why}`, () => {
+        const dir = project()
+        fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+        fs.writeFileSync(path.join(dir, 'apps', 'backend', '.env'), write)
+        for (const command of ['migrate', 'seed-admin']) {
+            const r = local([command], { cwd: dir, env: { ...db(0, 0), ...env } })
+            assert.notStrictEqual(r.status, 0, command)
+            assert.match(r.out, /points at .*, and this stack's Postgres is on localhost:\d+/)
+            assert.ok(!r.out.includes(dir), 'the message names the file from the project root')
+            assert.ok(!r.out.includes('deploy:x'), 'the url credentials stay out of the message')
+        }
+        assert.ok(!npxRuns(dir).some((run) => run.argv.includes('user') || (run.argv.includes('db:migrate') && !run.argv.includes('--help'))))
+    })
+}
+
+test('start warns about that database and seeds nothing into it', () => {
+    const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'apps', 'backend', '.env'), `DATABASE_URL=postgres://medusa:medusa@localhost:${PORTS.postgres + 7}/medusa-backend\n`)
+    const r = local(['start'], { cwd: dir, env: db(0, 0) })
+    assert.match(r.out, /this stack's Postgres is on localhost/)
+    assert.ok(!npxRuns(dir).some((run) => run.argv.includes('user')))
+})
+
+test('a database url on this stack passes', () => {
+    const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'apps', 'backend', '.env'), `DATABASE_URL=postgres://demo:demo@127.0.0.1:${PORTS.postgres}/demo_db\n`)
+    assert.strictEqual(local(['seed-admin'], { cwd: dir, env: db(0, 0) }).status, 0)
 })
 
 test('an email with a quote in it cannot break the query', () => {
@@ -76,4 +138,7 @@ test('an email with a quote in it cannot break the query', () => {
     const r = local(['admin'], { cwd: dir, env: db(1, 0) })
     assert.strictEqual(r.status, 0, r.out)
     assert.match(r.out, /o'brien@demo\.local/)
+    const queries = dockerCalls(dir).flat().filter((word) => /lower\(email\)/.test(word))
+    assert.ok(queries.length)
+    for (const query of queries) assert.ok(query.includes("o''brien@demo.local"), query)
 })

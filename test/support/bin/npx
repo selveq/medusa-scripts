@@ -1,0 +1,59 @@
+#!/usr/bin/env node
+// Stand-in for npx: records what lma asks for and answers Medusa's help.
+const fs = require('node:fs')
+
+const argv = process.argv.slice(2)
+const log = process.env.LMA_TEST_NPX_LOG
+if (log) fs.appendFileSync(log, JSON.stringify({ argv, cwd: process.cwd(), tty: Boolean(process.stdin.isTTY), at: process.hrtime.bigint().toString() }) + '\n')
+
+// the real npx, told a package by a parent npx, looks for its command inside that package
+if (process.env.npm_config_package) {
+    process.stderr.write(`sh: ${argv.find((a) => !a.startsWith('--'))}: command not found\n`)
+    process.exit(127)
+}
+
+if (argv.includes('db:migrate') && !argv.includes('--help') && process.env.LMA_TEST_MIGRATE_FAILS) process.exit(1)
+
+if (argv.includes('medusa') && argv.includes('--help')) {
+    const help = process.env.LMA_TEST_MEDUSA_HELP
+    process.stdout.write((help === undefined ? '--execute-safe-links --execute-safe-search' : help) + '\n')
+}
+// the files Medusa's installer leaves, in the shape lma has to rewrite
+const put = (root, file, text) => {
+    fs.mkdirSync(require('node:path').dirname(require('node:path').join(root, file)), { recursive: true })
+    fs.writeFileSync(require('node:path').join(root, file), text)
+}
+
+if (argv.some((a) => /^create-medusa-app/.test(a))) {
+    if (process.env.LMA_TEST_INSTALLER_FAILS) {
+        process.stdout.write('the installer ran out of luck\n')
+        process.exit(1)
+    }
+    const project = argv[argv.findIndex((a) => /^create-medusa-app/.test(a)) + 1]
+    if (process.env.LMA_TEST_INSTALLER_PARTIAL) {
+        put(process.cwd(), `${project}/apps/backend/package.json`, '{"name":"@dtc/backend"}\n')
+        process.exit(0)
+    }
+    // the real one puts this path unquoted into a shell command
+    const directory = argv.includes('--directory-path') ? argv[argv.indexOf('--directory-path') + 1] : process.cwd()
+    if (argv.includes('--directory-path') && /[\s()&]/.test(directory)) {
+        process.stdout.write('usage: git clone [<options>] [--] <repo> [<dir>]\n')
+        process.exit(129)
+    }
+    const root = require('node:path').join(directory, project)
+    const json = (v) => JSON.stringify(v, null, 2) + '\n'
+    if (process.env.LMA_TEST_INSTALLER_EXTRA) put(root, process.env.LMA_TEST_INSTALLER_EXTRA, '{}\n')
+    put(root, 'package.json', json({ name: project, private: false, scripts: {
+        'backend:dev': 'turbo dev --filter=@dtc/backend', 'storefront:dev': 'turbo dev --filter=@dtc/storefront',
+    }, workspaces: ['apps/**'] }))
+    put(root, 'package-lock.json', json({ packages: { 'apps/backend': { name: '@dtc/backend' }, 'node_modules/@dtc/storefront': { resolved: 'apps/storefront' } } }))
+    put(root, '.npmrc', 'auto-install-peers=true\n')
+    put(root, 'AGENTS.md', 'Run cd apps/backend and cd apps/storefront; packages @dtc/backend and @dtc/storefront.\n')
+    put(root, 'apps/backend/package.json', json({ name: '@dtc/backend', scripts: { dev: 'medusa develop' } }))
+    put(root, 'apps/backend/.env', 'MEDUSA_ADMIN_ONBOARDING_TYPE=default\nREDIS_URL=redis://localhost:6379\nJWT_SECRET=supersecret\nCOOKIE_SECRET=supersecret\nAUTH_MFA_ENCRYPTION_KEY=keepme\nMEDUSA_ADMIN_ONBOARDING_NEXTJS_DIRECTORY=' + root + '/apps/storefront\n')
+    put(root, 'apps/backend/node_modules/x/index.js', '')
+    put(root, 'apps/storefront/package.json', json({ name: '@dtc/storefront', scripts: { dev: 'next dev -p 8000', start: 'next start -p 8000', build: 'next build' } }))
+    put(root, 'apps/storefront/.env.local', 'NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY=\nNEXT_PUBLIC_MEDUSA_BACKEND_URL=http://localhost:9000\nNEXT_PUBLIC_DEFAULT_REGION=dk\nNEXT_PUBLIC_BASE_URL=http://localhost:8000\n')
+    put(root, 'node_modules/@dtc/backend/index.js', '')
+}
+process.exit(Number(process.env.LMA_TEST_NPX_EXIT || 0))

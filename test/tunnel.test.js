@@ -3,7 +3,8 @@ const test = require('node:test')
 const assert = require('node:assert')
 const fs = require('node:fs')
 const path = require('node:path')
-const { project, cleanup, tunnel, holdAppPort, serveApp, daemon, alive, killQuietly, cloudflaredCalls, PORTS } = require('./support/harness.js')
+const paths = require('../lib/paths.js')
+const { project, cleanup, local, tunnel, holdAppPort, serveApp, daemon, alive, killQuietly, cloudflaredCalls, PORTS } = require('./support/harness.js')
 
 const credentials = (dir) => {
     const creds = path.join(dir, 'config', 'local-medusa-app', 'tunnels')
@@ -19,8 +20,8 @@ const HOSTS = { tunnel: { name: 'demo', hostnames: { storefront: 'shop.example.t
 const launches = (dir) =>
     cloudflaredCalls(dir).filter((a) => a[0] === 'tunnel' && (a.includes('run') || a.includes('--url')))
 const launched = (dir) => launches(dir).length > 0
-const ingress = (dir) => path.join(dir, '.local-medusa-app', 'tunnel', 'config.yml')
-const pidFile = (dir) => path.join(dir, '.local-medusa-app', 'tunnel', 'cloudflared.pid')
+const ingress = (dir) => paths.sub(dir, 'tunnel', 'config.yml')
+const pidFile = (dir) => paths.sub(dir, 'tunnel', 'cloudflared.pid')
 
 test('help spells out what start and quick publish', () => {
     const dir = project(HOSTS)
@@ -240,6 +241,155 @@ test('publishing the backend with a guessable admin password is refused', async 
     } finally { await release() }
 })
 
+test('a guessable password in the database blocks publishing, after the config has moved on', async () => {
+    const dir = project(HOSTS)
+    fs.mkdirSync(paths.stateDir(dir), { recursive: true })
+    fs.writeFileSync(paths.sub(dir, 'seeded-weak'), '')
+    const release = await holdAppPort(dir, 'backend', PORTS.backend)
+    try {
+        const r = tunnel(['quick', 'backend', '--yes'], { cwd: dir })
+        assert.notStrictEqual(r.status, 0)
+        assert.match(r.out, /An account keeps the password it was created with/)
+        assert.ok(!launched(dir))
+    } finally { await release() }
+})
+
+test('a strong admin password written in the config is refused too: the dev server serves that file', async () => {
+    const dir = project({ ...HOSTS, admin: { email: 'admin@demo.local', password: 'Zk8vQ2mXw7Lp3Rt9' } })
+    const release = await holdAppPort(dir, 'backend', PORTS.backend)
+    try {
+        const r = tunnel(['quick', 'backend', '--yes'], { cwd: dir })
+        assert.notStrictEqual(r.status, 0)
+        assert.match(r.out, /admin\.password is in lma\.js, and the published dev server serves that file/)
+        assert.ok(!launched(dir))
+    } finally { await release() }
+})
+
+for (const [why, env] of [
+    ['JWT_SECRET=supersecret\nCOOKIE_SECRET=7e3bf1a22560aaca6610c7a34047a125\n', /JWT_SECRET is missing or a public default/],
+    ['JWT_SECRET=7e3bf1a22560aaca6610c7a34047a125\n', /COOKIE_SECRET is missing or a public default/],
+]) {
+    test(`a backend .env with a forgeable secret cannot be published: ${env.source.split(' ')[0]}`, async () => {
+        const dir = project(HOSTS)
+        fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+        fs.writeFileSync(path.join(dir, 'apps', 'backend', '.env'), why)
+        const release = await holdAppPort(dir, 'backend', PORTS.backend)
+        try {
+            const r = tunnel(['quick', 'backend', '--yes'], { cwd: dir })
+            assert.notStrictEqual(r.status, 0)
+            assert.match(r.out, env)
+            assert.ok(!launched(dir))
+        } finally { await release() }
+    })
+}
+
+test('a store alone can be published whatever the backend .env says', async () => {
+    const dir = project(HOSTS)
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'apps', 'backend', '.env'), 'JWT_SECRET=supersecret\n')
+    const release = await holdAppPort(dir, 'storefront', PORTS.storefront)
+    try {
+        const r = tunnel(['quick', 'storefront', '--yes'], { cwd: dir })
+        assert.strictEqual(r.status, 0, r.out)
+        assert.ok(launched(dir))
+    } finally { tunnel(['stop'], { cwd: dir }); await release() }
+})
+
+test('a log follower is not a tunnel: not reported, not blocking, not killed', () => {
+    const dir = project(HOSTS)
+    fs.mkdirSync(paths.sub(dir, 'tunnel'), { recursive: true })
+    const pid = daemon(dir, ['tail', '-f', paths.sub(dir, 'tunnel', 'cloudflared.log')])
+    try {
+        assert.match(tunnel(['status'], { cwd: dir }).out, /Not running/)
+        const stopped = tunnel(['stop'], { cwd: dir })
+        assert.match(stopped.out, /Tunnel is not running/)
+        assert.ok(alive(pid), 'it must survive')
+    } finally { killQuietly(pid) }
+})
+
+test('a tunnel with only the metrics port in common is still this project\'s', () => {
+    const dir = project(HOSTS)
+    const pid = daemon(dir, ['cloudflared', 'tunnel', '--metrics', `127.0.0.1:${PORTS.metrics}`, 'run'])
+    try {
+        assert.match(tunnel(['stop'], { cwd: dir }).out, /found an unrecorded cloudflared/)
+        assert.ok(!alive(pid))
+    } finally { killQuietly(pid) }
+})
+
+test('a tunnel with only the uuid in common is still this project\'s', () => {
+    const dir = project(HOSTS)
+    // its own: the other test files share the stand-in's default, and their tunnel stop would take this daemon
+    const uuid = '44444444-5555-6666-7777-888888888888'
+    const pid = daemon(dir, ['cloudflared', 'tunnel', 'run', uuid])
+    try {
+        assert.match(tunnel(['stop'], { cwd: dir, env: { LMA_TEST_TUNNEL_UUID: uuid } }).out, /found an unrecorded cloudflared/)
+        assert.ok(!alive(pid))
+    } finally { killQuietly(pid) }
+})
+
+test('start says why when Cloudflare cannot be asked, and publishes nothing', async () => {
+    const dir = project(HOSTS)
+    const release = await holdAppPort(dir, 'backend', PORTS.backend)
+    try {
+        const r = tunnel(['start', 'backend', '--yes'], { cwd: dir, env: { ...credentials(dir), LMA_TEST_TUNNEL_LIST_FAILS: '1' } })
+        assert.notStrictEqual(r.status, 0)
+        assert.match(r.out, /cloudflared tunnel list failed: failed to reach the edge/)
+        assert.match(r.out, /Could not ask Cloudflare/)
+        assert.ok(!launched(dir))
+    } finally { await release() }
+})
+
+for (const command of ['stop', 'destroy']) {
+    test(`lma ${command} takes the tunnel down: left up it would publish whatever binds that port next`, async () => {
+        const dir = project(HOSTS)
+        const release = await holdAppPort(dir, 'storefront', PORTS.storefront)
+        try {
+            assert.strictEqual(tunnel(['quick', 'storefront', '--yes'], { cwd: dir }).status, 0)
+            const pid = Number(fs.readFileSync(pidFile(dir), 'utf8'))
+            assert.ok(alive(pid))
+            assert.strictEqual(JSON.parse(local(['status', '--json'], { cwd: dir }).stdout).published, true)
+            assert.match(local(['status'], { cwd: dir }).out, /published to the internet/)
+            const r = local([command, '--yes'], { cwd: dir })
+            assert.strictEqual(r.status, 0, r.out)
+            assert.match(r.out, /Tunnel stopped/)
+            assert.ok(!alive(pid), 'it is gone')
+        } finally { tunnel(['stop'], { cwd: dir }); await release() }
+    })
+}
+
+test('lma stop leaves the tunnel of another folder alone, even under the same tunnel name', () => {
+    const owner = project(HOSTS)
+    const uuid = '22222222-3333-4444-5555-666666666666'
+    const pid = daemon(owner, ['cloudflared', 'tunnel', 'run', uuid])
+    try {
+        const other = project(HOSTS)
+        const r = local(['stop'], { cwd: other, env: { LMA_TEST_TUNNEL_UUID: uuid } })
+        assert.strictEqual(r.status, 0, r.out)
+        assert.ok(alive(pid), 'it belongs to the other checkout')
+    } finally { killQuietly(pid) }
+})
+
+test('lma tunnel stop still clears one by its uuid: that is the same tunnel', () => {
+    const owner = project(HOSTS)
+    const uuid = '33333333-4444-5555-6666-777777777777'
+    const pid = daemon(owner, ['cloudflared', 'tunnel', 'run', uuid])
+    try {
+        tunnel(['stop'], { cwd: project(HOSTS), env: { LMA_TEST_TUNNEL_UUID: uuid } })
+        assert.ok(!alive(pid))
+    } finally { killQuietly(pid) }
+})
+
+test('stop stays quiet when no tunnel is up', () => {
+    assert.doesNotMatch(local(['stop'], { cwd: project(HOSTS) }).out, /[Tt]unnel/)
+})
+
+test('hostnames save for an app whose name has a hyphen', () => {
+    const dir = project({ apps: { backend: null, 'my-api': { role: 'backend', port: PORTS.backend } } })
+    require('../lib/confedit.js').setHostnames(dir, { 'my-api': 'api.example.test' })
+    delete require.cache[require.resolve(path.join(dir, 'lma.js'))]
+    assert.strictEqual(require(path.join(dir, 'lma.js')).tunnel.hostnames['my-api'], 'api.example.test')
+})
+
 test('the weak-admin refusal can be overridden deliberately', async () => {
     const dir = project({ ...HOSTS, admin: { email: 'admin@demo.local', password: 'medusa123' } })
     const release = await holdAppPort(dir, 'backend', PORTS.backend)
@@ -276,7 +426,7 @@ test('a remembered acceptance republishes the same routes without a second promp
         assert.match(first.out, /trycloudflare\.com/)
         assert.ok(launched(dir))
 
-        const ack = path.join(dir, '.local-medusa-app', 'tunnel', 'exposure-ack')
+        const ack = paths.sub(dir, 'tunnel', 'exposure-ack')
         assert.ok(fs.existsSync(ack), 'the accepted route set is recorded')
         assert.strictEqual(fs.readFileSync(ack, 'utf8'), `quick|storefront=shop.example.test:${PORTS.storefront}`,
             'the port is part of what was agreed to, not just the name')
@@ -295,8 +445,8 @@ test('a remembered acceptance republishes the same routes without a second promp
 })
 
 const rememberAck = (dir, value) => {
-    fs.mkdirSync(path.join(dir, '.local-medusa-app', 'tunnel'), { recursive: true })
-    fs.writeFileSync(path.join(dir, '.local-medusa-app', 'tunnel', 'exposure-ack'), value)
+    fs.mkdirSync(paths.sub(dir, 'tunnel'), { recursive: true })
+    fs.writeFileSync(paths.sub(dir, 'tunnel', 'exposure-ack'), value)
 }
 
 test('a new hostname invalidates the remembered acceptance', async () => {
@@ -356,10 +506,10 @@ test('tunnel start stays quiet when the origin is already allowed', async () => 
 
 // a stale pid file must not read as "not running"
 const orphanTunnel = (dir) => {
-    fs.mkdirSync(path.join(dir, '.local-medusa-app', 'tunnel'), { recursive: true })
-    fs.writeFileSync(path.join(dir, '.local-medusa-app', 'tunnel', 'cloudflared.pid'), '999999')
+    fs.mkdirSync(paths.sub(dir, 'tunnel'), { recursive: true })
+    fs.writeFileSync(paths.sub(dir, 'tunnel', 'cloudflared.pid'), '999999')
     return daemon(dir, ['cloudflared', 'tunnel', '--config',
-        path.join(dir, '.local-medusa-app', 'tunnel', 'config.yml'), 'run'])
+        paths.sub(dir, 'tunnel', 'config.yml'), 'run'])
 }
 
 test('an unrecorded tunnel is found and stopped, not reported as absent', async () => {
@@ -393,7 +543,7 @@ test('stop leaves a reused pid alone instead of killing a stranger', () => {
     const dir = project(HOSTS)
     const pid = daemon(dir, ['nothing-to-do-with-tunnels'])
     try {
-        const tunnelDir = path.join(dir, '.local-medusa-app', 'tunnel')
+        const tunnelDir = paths.sub(dir, 'tunnel')
         fs.mkdirSync(tunnelDir, { recursive: true })
         fs.writeFileSync(path.join(tunnelDir, 'cloudflared.pid'), `${pid}\n`)
         const r = tunnel(['stop'], { cwd: dir })

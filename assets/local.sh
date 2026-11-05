@@ -10,33 +10,41 @@ usage() {
   cat <<EOF
 Local stack for '${LMA_COMPOSE_PROJECT:-<project>}' (config: lma.js / lma.cjs; infra in Docker, apps on host)
 
-  lma init [--scripts]   scaffold the config + the 'lma' npm alias here
+  lma init               in an empty folder: ask two names, install the latest Medusa, start it
+                         (--backend <name> --store <name> answers without asking; --yes starts Docker)
+                         in an existing project: scaffold the config + the 'lma' npm alias
                          (--scripts adds an alias per command, --no-scripts adds none)
   lma start              start Docker if needed, infra containers, then both dev servers
   lma stop               remove containers + network (data volumes kept)
-  lma restart            recreate the containers
+  lma restart            recreate the containers, then both dev servers
+  lma restart <app>      restart that dev server only, docker untouched
   lma destroy            remove containers AND volumes (asks confirmation)
-  lma status             show container state
-  lma logs [svc]         container logs, or: lma logs backend|storefront
+  lma status [--json]    show container and app state; exits non zero when one is down
+  lma logs [svc]         follow container logs, or: lma logs <app>
+  lma logs <app> --errors --since-restart
+                         print and return: either flag or both
+  lma run -- <command>   run it with this stack's DB_* and DATABASE_URL, keep the Mac awake, report any sleep
   lma psql               psql shell into the database
   lma redis              redis-cli shell
   lma import-db <f>      drop DB, recreate, import .sql / .sql.gz / pg_dump file
-  lma dump-db            dump the DB gzipped into .local-medusa-app/dumps/
+  lma dump-db            dump the DB gzipped into the state folder, or to a path you give
   lma reset-db           drop + recreate an empty DB (asks confirmation)
-  lma migrate            medusa db:migrate in ${BACKEND_DIR:-apps/backend}, then seed the admin
+  lma migrate            containers up, medusa db:migrate in ${BACKEND_DIR:-apps/backend}, then seed the admin
+                         (off a terminal: safe link and search changes only, nothing is deleted)
   lma seed-admin         create the configured admin if no admin exists (auto on start/migrate)
   lma admin              print the admin URL, email and password
   lma show-env           print DATABASE_URL/REDIS_URL lines for the backend .env
-  lma ports [--reset]    show / reallocate the closest available port map
+  lma ports [--reset] [--json]
+                         show / reallocate the closest available port map
   lma tunnel             Cloudflare tunnel (setup/start/quick/stop/status/logs)
   lma --version          print the installed version
 
 Flags on start/stop/restart/destroy/migrate/seed-admin and the db commands:
-  -n, --dry-run          print what would happen, change nothing
+  -n, --dry-run          print what would happen; starts, stops and deletes nothing
   -y, --yes              skip the confirmation prompt (required when not on a tty)
 
-  secrets, dumps and pids live in .local-medusa-app/; ports and logs in
-  node_modules/.local-medusa-app-cache/ (regenerated after a clean install)
+  secrets, dumps, logs and pids live in ~/.local-medusa-app/<project>/, out of reach of the
+  admin's dev server; ports in node_modules/.local-medusa-app-cache/ (regenerated after a clean install)
   run via npx lma, npm run lma <cmd>, or bare lma inside npm scripts
 EOF
 }
@@ -59,6 +67,11 @@ red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 note()  { printf '\033[36m%s\033[0m\n' "$*"; }
 dim()   { printf '\033[2m%s\033[0m\n' "$*"; }
+
+# only what brings the stack up may move a port; reading must not change what it reads
+PORTS_FROZEN=1
+case "${1:-help}" in start|up|restart|migrate) PORTS_FROZEN=0 ;; esac
+case " $* " in *" -n "*|*" --dry-run "*) PORTS_FROZEN=1 ;; esac
 
 # parsed only for commands that support them, so `lma psql -c` passes its own through
 DRY_RUN=0
@@ -111,7 +124,7 @@ const c = cfg.load(root);
 const p = (c.services || {}).postgres || {};
 const r = (c.services || {}).redis || {};
 const x = c.proxy || {};
-const a = c.apps || {};
+const ap = cfg.apps(c);
 const ad = c.admin || {};
 const proj = cfg.project(root, c);
 const img = images.all(c, (m) => console.error("image pin warning: " + m));
@@ -121,7 +134,6 @@ console.log([
   `_C_PROJECT=${q(proj)}`,
   `_C_PROJECT_ID=${q(lib.projectId(root, c))}`,
   `_C_STATE_DIR=${q(require("node:path").dirname(sec.file))}`,
-  `_C_CACHE_DIR=${q(require(process.argv[6]).cacheDir(root))}`,
   `_C_PG_PORT=${q(p.port || 5432)}`,
   `_C_DB_USER=${q(p.user || "app")}`,
   `_C_DB_PASSWORD=${q(p.password || "app")}`,
@@ -129,12 +141,15 @@ console.log([
   `_C_REDIS_PORT=${q(r.port || 6379)}`,
   `_C_HTTP_PORT=${q(x.port || 80)}`,
   `_C_DOMAIN=${q(x.domain || "localhost")}`,
-  `_C_BACKEND_DIR=${q((a.backend || {}).dir || "apps/backend")}`,
-  `_C_BACKEND_PORT=${q((a.backend || {}).port || 9000)}`,
-  `_C_STOREFRONT_PORT=${q((a.storefront || {}).port || 8000)}`,
-  `_C_STOREFRONT_DIR=${q((a.storefront || {}).dir || "apps/storefront")}`,
+  `_C_BACKEND_NAME=${q(ap.backend.name)}`,
+  `_C_BACKEND_DIR=${q(ap.backend.dir)}`,
+  `_C_BACKEND_PORT=${q(ap.backend.port)}`,
+  `_C_STORE_NAME=${q(ap.store.name)}`,
+  `_C_STOREFRONT_PORT=${q(ap.store.port)}`,
+  `_C_STOREFRONT_DIR=${q(ap.store.dir)}`,
   `_C_ADMIN_EMAIL=${q(ad.email || "admin@" + proj + ".local")}`,
   `_C_ADMIN_PASSWORD=${q(ad.password || "")}`,
+  `_C_WEAK_SECRETS=${q(secrets.weakAppSecrets(root, ap.backend.dir).join(" "))}`,
   `_C_POSTGRES_IMAGE=${q(img.postgres)}`,
   `_C_REDIS_IMAGE=${q(img.redis)}`,
   `_C_PROXY_IMAGE=${q(img.proxy)}`,
@@ -143,7 +158,7 @@ console.log([
   `_S_COOKIE_SECRET=${q(sec.values.LMA_COOKIE_SECRET)}`,
 ].join("\n"))
 } catch (e) { console.error(e.message); process.exit(1) }
-' "$ROOT" "$LIB/ports.js" "$LIB/config.js" "$LIB/secrets.js" "$LIB/images.js" "$LIB/paths.js" 2>"$_cfg_err")"; then
+' "$ROOT" "$LIB/ports.js" "$LIB/config.js" "$LIB/secrets.js" "$LIB/images.js" 2>"$_cfg_err")"; then
   red "failed to read the lma config in $ROOT:"
   cat "$_cfg_err" >&2
   rm -f "$_cfg_err"
@@ -155,11 +170,10 @@ rm -f "$_cfg_err"
 eval "$_cfg"
 
 STATE_DIR="$_C_STATE_DIR"
-CACHE_DIR="$_C_CACHE_DIR"
 DUMP_DIR="$STATE_DIR/dumps"
 RUN_DIR="$STATE_DIR/run"
 LOCK_DIR="$STATE_DIR/lock"
-LOG_DIR="$CACHE_DIR/logs"
+LOG_DIR="$STATE_DIR/logs"
 
 # ports, plus the two values derived from them: allowed hosts and CORS origins
 _C_ALLOWED_HOSTS=""
@@ -168,7 +182,7 @@ _ports_err="$(mktemp)"
 if _pmap="$(node -e '
 (async () => {
   const root = process.argv[2]
-  const { ports } = await require(process.argv[1]).resolve(root)
+  const { ports } = await require(process.argv[1]).resolve(root, { frozen: process.argv[7] === "1" })
   const cfg = require(process.argv[3])
   const hosts = require(process.argv[4])
   const cors = require(process.argv[5])
@@ -178,10 +192,13 @@ if _pmap="$(node -e '
   // app keys may hold chars that are invalid in a shell variable name (admin-ui)
   const shellName = (k) => k.toUpperCase().replace(/[^A-Z0-9_]/g, "_")
   const out = Object.entries(ports).map(([k, v]) => `_P_${shellName(k)}=${v}`)
+  const ap = cfg.apps(c)
+  if (ports[ap.backend.name]) out.push(`_P_BACKEND=${ports[ap.backend.name]}`)
+  if (ports[ap.store.name]) out.push(`_P_STOREFRONT=${ports[ap.store.name]}`)
   const inherited = hosts.merge(process.env[hosts.ENV_VAR], hosts.adminAllowedHosts(c))
   out.push(`_C_ALLOWED_HOSTS=${q(inherited.join(","))}`)
   // merge with the backend .env so lma only ever adds origins
-  const dir = ((c.apps || {}).backend || {}).dir || "apps/backend"
+  const dir = ap.backend.dir
   const appEnv = envfile.read(require("node:path").join(root, dir, ".env"))
   const merged = cors.resolve(c, ports, { env: process.env, appEnv })
   out.push(`_CORS_STORE=${q(merged.STORE_CORS)}`)
@@ -189,10 +206,12 @@ if _pmap="$(node -e '
   out.push(`_CORS_AUTH=${q(merged.AUTH_CORS)}`)
   process.stdout.write(out.join("\n") + "\n")
 })().catch((e) => { console.error(e.message); process.exit(1) })
-' "$LIB/ports.js" "$ROOT" "$LIB/config.js" "$LIB/hosts.js" "$LIB/cors.js" "$LIB/envfile.js" 2>"$_ports_err")"; then
+' "$LIB/ports.js" "$ROOT" "$LIB/config.js" "$LIB/hosts.js" "$LIB/cors.js" "$LIB/envfile.js" "$PORTS_FROZEN" 2>"$_ports_err")"; then
   eval "$_pmap"
 else
-  red "port allocation failed ($(cat "$_ports_err")); using the preferred ports from the config"
+  red "no ports for this stack: $(cat "$_ports_err")" >&2
+  rm -f "$_ports_err"
+  exit 1
 fi
 rm -f "$_ports_err"
 
@@ -215,7 +234,7 @@ LMA_ADMIN_EMAIL="${LMA_ADMIN_EMAIL:-$_C_ADMIN_EMAIL}"
 # env > config > secrets.env
 if [ -n "${LMA_ADMIN_PASSWORD:-}" ]; then ADMIN_PASSWORD_SOURCE="env LMA_ADMIN_PASSWORD"
 elif [ -n "$_C_ADMIN_PASSWORD" ]; then ADMIN_PASSWORD_SOURCE="admin.password in the config"
-else ADMIN_PASSWORD_SOURCE=".local-medusa-app/secrets.env"; fi
+else ADMIN_PASSWORD_SOURCE="$STATE_DIR/secrets.env"; fi
 LMA_ADMIN_PASSWORD="${LMA_ADMIN_PASSWORD:-${_C_ADMIN_PASSWORD:-$_S_ADMIN_PASSWORD}}"
 LMA_JWT_SECRET="$_S_JWT_SECRET"
 LMA_COOKIE_SECRET="$_S_COOKIE_SECRET"
@@ -223,18 +242,48 @@ if [ "$LMA_HTTP_PORT" = "80" ]; then LMA_BASE_URL="http://$LMA_DOMAIN"; else LMA
 PG_CONTAINER="$LMA_COMPOSE_PROJECT-postgres"
 REDIS_CONTAINER="$LMA_COMPOSE_PROJECT-redis"
 STOREFRONT_DIR="${LMA_STOREFRONT_DIR:-$_C_STOREFRONT_DIR}"
+BACKEND_NAME="$_C_BACKEND_NAME"
+STORE_NAME="$_C_STORE_NAME"
 
 COMPOSE=(docker compose -f "$COMPOSE_FILE")
 
+# in the environment and not on the command line: ps shows the command line to every local user
 weak_admin_password() {
-  node -e 'process.exit(require(process.argv[1]).isWeak(process.argv[2]) ? 0 : 1)' \
-    "$LIB/secrets.js" "$LMA_ADMIN_PASSWORD"
+  LMA_CHECK_PASSWORD="$LMA_ADMIN_PASSWORD" node -e 'process.exit(require(process.argv[1]).isWeak(process.env.LMA_CHECK_PASSWORD) ? 0 : 1)' \
+    "$LIB/secrets.js"
 }
 
 warn_weak_admin() {
   weak_admin_password || return 0
   red "the admin password from $ADMIN_PASSWORD_SOURCE is guessable."
   note "  fine while the stack is only on localhost; never expose it with 'lma tunnel'."
+}
+
+warn_weak_secrets() {
+  [ -n "$_C_WEAK_SECRETS" ] || return 0
+  red "$BACKEND_DIR/.env: $_C_WEAK_SECRETS is missing or a public default, so anyone who reaches this backend can forge an admin login"
+  note "  put a real one in that file: openssl rand -hex 32"
+}
+
+# Medusa writes wherever its env points, and lma's checks read this stack
+guard_database() {
+  local problem
+  problem="$(node "$LIB/db-target.js" "$ROOT/$BACKEND_DIR/.env" "$LMA_PG_PORT")"
+  [ -z "$problem" ] && return 0
+  red "$problem"
+  note "  so lma did not write to it. lma show-env has the right url; run medusa yourself if you do mean that database"
+  return 1
+}
+
+uri_part() {
+  case "$1" in
+    *[!A-Za-z0-9._~-]*) LMA_RAW="$1" node -p 'encodeURIComponent(process.env.LMA_RAW)' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+db_url() {
+  printf 'postgres://%s:%s@localhost:%s/%s' "$(uri_part "$LMA_DB_USER")" "$(uri_part "$LMA_DB_PASSWORD")" "$LMA_PG_PORT" "$(uri_part "$LMA_DB_NAME")"
 }
 
 # one mutating lma per project; racing starts produce half-created containers
@@ -255,6 +304,8 @@ acquire_lock() {
       return 0
     fi
     owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    # it made the folder and has not written its pid yet: that is a holder, not a leftover
+    if [ -z "$owner" ] && [ "$tries" = "0" ]; then tries=1; sleep 0.3; continue; fi
     owner_cmd="$(cat "$LOCK_DIR/cmd" 2>/dev/null || true)"
     if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null && same_process "$owner" "$LOCK_DIR/id" '*local.sh*'; then
       red "'lma ${owner_cmd:-?}' (pid $owner) is already working on this project."
@@ -267,30 +318,16 @@ acquire_lock() {
   red "could not take the project lock at $LOCK_DIR"; exit 1
 }
 
-need_docker() {
-  command -v docker >/dev/null || { red "docker is not installed / not on PATH"; exit 1; }
-  if ! docker info >/dev/null 2>&1; then
-    if [ "$ASSUME_YES" != "1" ]; then
-      [ -t 0 ] || { red "Docker is not running, and there is no terminal to ask on. Start it, or pass --yes."; exit 1; }
-      read -r -p "Docker is not running. Start Docker Desktop? [y/N] " ans || ans=""
-      case "$ans" in y|Y|yes|YES) ;; *) note "aborted"; exit 1 ;; esac
-    fi
-    if [ "$(uname)" = "Darwin" ]; then
-      note "starting Docker Desktop..."
-      open -g -a Docker || { red "could not launch Docker Desktop"; exit 1; }
-    else
-      red "start the docker daemon first (e.g. systemctl start docker)"; exit 1
-    fi
-    local start_ts=$SECONDS
-    while [ $((SECONDS - start_ts)) -lt 120 ]; do
-      docker info >/dev/null 2>&1 && { green "docker is up"; return 0; }
-      sleep 2
-    done
-    red "docker did not become ready in 120s; open Docker Desktop and check it manually"; exit 1
-  fi
-}
+# shellcheck source=/dev/null
+source "$ASSETS/docker.sh"
 
 docker_running() { docker info >/dev/null 2>&1; }
+
+service_state() {
+  local state
+  state="$(docker inspect -f '{{.State.Health.Status}}' "$1" 2>/dev/null || true)"
+  printf '%s' "${state:-missing}"
+}
 
 wait_healthy() {
   note "waiting for containers to become healthy..."
@@ -324,10 +361,11 @@ backend_cli() {
   (
     cd "$ROOT/$BACKEND_DIR" || exit 1
     if [ ! -f .env ]; then
-      export DATABASE_URL="${DATABASE_URL:-postgres://$LMA_DB_USER:$LMA_DB_PASSWORD@localhost:$LMA_PG_PORT/$LMA_DB_NAME}"
+      export DATABASE_URL="${DATABASE_URL:-$(db_url)}"
       export REDIS_URL="${REDIS_URL:-redis://localhost:$LMA_REDIS_PORT}"
     fi
-    npx medusa "$@"
+    # --no: with node_modules gone, npx would fetch the unrelated package called medusa and hand it these arguments
+    npx --no medusa "$@"
   )
 }
 
@@ -352,14 +390,17 @@ other_admins() {
 }
 
 SEEDED_FILE_NAME="seeded-admin"
+SEEDED_WEAK_FILE_NAME="seeded-weak"
 
 # seed the configured account when missing, not merely when the table is empty
 seed_admin() {
   local mode="${1:-manual}" count
-  count="$(admin_count)"
+  # real psql fails on a missing table, and set -e must not end start here
+  count="$(admin_count || true)"
   if [ -z "$count" ]; then
     [ "$mode" = "auto" ] && return 0   # DB not migrated yet; nothing to seed
-    red "cannot check admin users; no user table yet. Run: lma migrate"
+    if ! docker_running; then red "docker is not running; lma start brings the stack up"
+    else red "cannot check admin users; no user table yet. Run: lma migrate"; fi
     return 1
   fi
   if admin_exists; then
@@ -378,15 +419,20 @@ seed_admin() {
     return 1
   fi
   printf '%s\n' "$LMA_ADMIN_EMAIL" > "$STATE_DIR/$SEEDED_FILE_NAME"
-  green "admin seeded: $LMA_ADMIN_EMAIL / $LMA_ADMIN_PASSWORD"
-  dim  "  password from $ADMIN_PASSWORD_SOURCE; print it again with: lma admin"
+  # the account keeps this password whatever the config says later, and lma tunnel must know
+  if weak_admin_password; then : > "$STATE_DIR/$SEEDED_WEAK_FILE_NAME"; else rm -f "$STATE_DIR/$SEEDED_WEAK_FILE_NAME"; fi
+  # a log file is no place for it; lma admin prints it on request
+  if [ -t 1 ]; then green "admin seeded: $LMA_ADMIN_EMAIL / $LMA_ADMIN_PASSWORD"
+  else green "admin seeded: $LMA_ADMIN_EMAIL"; fi
+  dim  "  password from $ADMIN_PASSWORD_SOURCE; print it with: lma admin"
   warn_weak_admin
 }
 
 port_up() { (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1; }
 
 # pids get reused: the start time is what makes a recorded pid ours
-proc_started() { ps -p "$1" -o lstart= 2>/dev/null | tr -s ' '; }
+# ps prints it in the locale and timezone it runs under, so they are pinned
+proc_started() { LC_ALL=C TZ=UTC ps -p "$1" -o lstart= 2>/dev/null | tr -s ' '; }
 
 record_pid() { # $1 = name, $2 = pid; fails when it is already gone
   local started
@@ -398,7 +444,9 @@ record_pid() { # $1 = name, $2 = pid; fails when it is already gone
 
 same_process() { # $1 = pid, $2 = recorded start time file, $3 = command pattern when nothing was recorded
   if [ -s "$2" ]; then
-    [ "$(cat "$2" 2>/dev/null)" = "$(proc_started "$1")" ]
+    # a server started before 0.3.0 was recorded in whatever locale that shell had
+    [ "$(cat "$2" 2>/dev/null)" = "$(proc_started "$1")" ] ||
+      [ "$(cat "$2" 2>/dev/null)" = "$(ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ')" ]
   else
     # shellcheck disable=SC2254
     case "$(ps -p "$1" -o command= 2>/dev/null)" in $3) return 0 ;; *) return 1 ;; esac
@@ -445,6 +493,84 @@ publishable_key() {
     "SELECT token FROM api_key WHERE type='publishable' AND revoked_at IS NULL AND deleted_at IS NULL LIMIT 1" 2>/dev/null | tr -d '[:space:]'
 }
 
+# a column for the start messages, as wide as the longest default name
+label() { printf '%-11s' "$1:"; }
+
+app_port() { if [ "$1" = "$BACKEND_NAME" ]; then printf '%s' "$LMA_BACKEND_PORT"; else printf '%s' "$LMA_STOREFRONT_PORT"; fi; }
+
+# the mark is where lma logs --since-restart begins
+launch_app() {
+  local log="$LOG_DIR/$1.log" pid
+  printf -- '--- lma started %s at %s ---\n' "$1" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$log"
+  if pid="$(node "$LIB/detach.js" "$log" npm run dev)"; then
+    record_pid "$1" "$pid" || red "$1: exited immediately; check: lma logs $1"
+  else
+    red "$1: could not start; check: lma logs $1"
+  fi
+}
+
+# a dev server restarting on a file change is alive with its port closed: a second one would orphan it
+start_backend() {
+  local pid
+  if port_up "$LMA_BACKEND_PORT"; then
+    note "$(label "$BACKEND_NAME") already running on :$LMA_BACKEND_PORT"
+  elif pid="$(app_pid "$BACKEND_NAME")"; then
+    note "$(label "$BACKEND_NAME") already running as pid $pid, its port is closed for now"
+  else
+    note "$(label "$BACKEND_NAME") starting dev server"
+    (
+      cd "$ROOT/$BACKEND_DIR" || exit 1
+      export PORT="$LMA_BACKEND_PORT"
+      # set even when the app has a .env: dotenv does not override an export
+      [ -n "$LMA_ALLOWED_HOSTS" ] && export __MEDUSA_ADMIN_ADDITIONAL_ALLOWED_HOSTS="$LMA_ALLOWED_HOSTS"
+      # merged with the app's .env, never replacing it
+      export STORE_CORS="$_CORS_STORE" ADMIN_CORS="$_CORS_ADMIN" AUTH_CORS="$_CORS_AUTH"
+      # inject dev defaults only when the app has no .env of its own
+      if [ ! -f .env ]; then
+        export DATABASE_URL="${DATABASE_URL:-$(db_url)}"
+        export REDIS_URL="${REDIS_URL:-redis://localhost:$LMA_REDIS_PORT}"
+        export JWT_SECRET="${JWT_SECRET:-$LMA_JWT_SECRET}" COOKIE_SECRET="${COOKIE_SECRET:-$LMA_COOKIE_SECRET}"
+      fi
+      launch_app "$BACKEND_NAME"
+    )
+  fi
+}
+
+# what the store's own env files set stays theirs: an export would win over them
+store_sets() { grep -qsE "^[[:space:]]*(export[[:space:]]+)?$1=[^[:space:]]" "$ROOT/$STOREFRONT_DIR/.env" "$ROOT/$STOREFRONT_DIR/.env.local"; }
+store_default() { store_sets "$1" || export "$1=${!1:-$2}"; }
+
+SKIPPED_STORE=0
+
+start_store() {
+  local pid key=""
+  if port_up "$LMA_STOREFRONT_PORT"; then
+    note "$(label "$STORE_NAME") already running on :$LMA_STOREFRONT_PORT"
+  elif pid="$(app_pid "$STORE_NAME")"; then
+    note "$(label "$STORE_NAME") already running as pid $pid, its port is closed for now"
+  else
+    if ! store_sets NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY; then
+      docker_running || { red "$STORE_NAME: docker is not running; lma start brings the stack up"; SKIPPED_STORE=1; return 0; }
+      key="$(publishable_key || true)"
+      if [ -z "$key" ]; then
+        red "$STORE_NAME: skipped; no publishable API key; create one at $LMA_BASE_URL/app → Settings → Publishable API Keys, then: lma restart"
+        SKIPPED_STORE=1
+        return 0
+      fi
+    fi
+    note "$(label "$STORE_NAME") starting dev server"
+    (
+      cd "$ROOT/$STOREFRONT_DIR" || exit 1
+      export PORT="$LMA_STOREFRONT_PORT"
+      store_default MEDUSA_BACKEND_URL "http://localhost:$LMA_BACKEND_PORT"
+      store_default NEXT_PUBLIC_MEDUSA_BACKEND_URL "http://localhost:$LMA_BACKEND_PORT"
+      store_default NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY "$key"
+      store_default NEXT_PUBLIC_BASE_PATH ""
+      launch_app "$STORE_NAME"
+    )
+  fi
+}
+
 start_apps() {
   if [ "$DRY_RUN" = "1" ]; then
     [ -n "$LMA_ALLOWED_HOSTS" ] && plan "__MEDUSA_ADMIN_ADDITIONAL_ALLOWED_HOSTS=$LMA_ALLOWED_HOSTS"
@@ -456,98 +582,98 @@ start_apps() {
     return 0
   fi
   mkdir -p "$LOG_DIR" "$RUN_DIR"
-  local pid
-  # a dev server restarting on a file change is alive with its port closed: a second one would orphan it
-  if [ -d "$ROOT/$BACKEND_DIR" ]; then
-    if port_up "$LMA_BACKEND_PORT"; then
-      note "backend:    already running on :$LMA_BACKEND_PORT"
-    elif pid="$(app_pid backend)"; then
-      note "backend:    already running as pid $pid, its port is closed for now"
-    else
-      note "backend:    starting dev server"
-      (
-        cd "$ROOT/$BACKEND_DIR" || exit 1
-        export PORT="${PORT:-$LMA_BACKEND_PORT}"
-        # set even when the app has a .env: dotenv does not override an export
-        [ -n "$LMA_ALLOWED_HOSTS" ] && export __MEDUSA_ADMIN_ADDITIONAL_ALLOWED_HOSTS="$LMA_ALLOWED_HOSTS"
-        # merged with the app's .env, never replacing it
-        export STORE_CORS="$_CORS_STORE" ADMIN_CORS="$_CORS_ADMIN" AUTH_CORS="$_CORS_AUTH"
-        # inject dev defaults only when the app has no .env of its own
-        if [ ! -f .env ]; then
-          export DATABASE_URL="${DATABASE_URL:-postgres://$LMA_DB_USER:$LMA_DB_PASSWORD@localhost:$LMA_PG_PORT/$LMA_DB_NAME}"
-          export REDIS_URL="${REDIS_URL:-redis://localhost:$LMA_REDIS_PORT}"
-          export JWT_SECRET="${JWT_SECRET:-$LMA_JWT_SECRET}" COOKIE_SECRET="${COOKIE_SECRET:-$LMA_COOKIE_SECRET}"
-        fi
-        nohup npm run dev >> "$LOG_DIR/backend.log" 2>&1 &
-        record_pid backend "$!" || red "backend: exited immediately; check: lma logs backend"
-      )
-    fi
-  fi
-  if [ -d "$ROOT/$STOREFRONT_DIR" ]; then
-    if port_up "$LMA_STOREFRONT_PORT"; then
-      note "storefront: already running on :$LMA_STOREFRONT_PORT"
-    elif pid="$(app_pid storefront)"; then
-      note "storefront: already running as pid $pid, its port is closed for now"
-    else
-      key=""
-      if [ ! -f "$ROOT/$STOREFRONT_DIR/.env" ]; then
-        key="$(publishable_key || true)"
-        if [ -z "$key" ]; then
-          red "storefront: skipped; no publishable API key; create one at $LMA_BASE_URL/app → Settings → Publishable API Keys, then: lma restart"
-          return 0
-        fi
-      fi
-      note "storefront: starting dev server"
-      (
-        cd "$ROOT/$STOREFRONT_DIR" || exit 1
-        export PORT="${PORT:-$LMA_STOREFRONT_PORT}"
-        if [ ! -f .env ]; then
-          export MEDUSA_BACKEND_URL="${MEDUSA_BACKEND_URL:-http://localhost:$LMA_BACKEND_PORT}"
-          export NEXT_PUBLIC_MEDUSA_BACKEND_URL="${NEXT_PUBLIC_MEDUSA_BACKEND_URL:-http://localhost:$LMA_BACKEND_PORT}"
-          export NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY="${NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY:-$key}"
-          export NEXT_PUBLIC_BASE_PATH="${NEXT_PUBLIC_BASE_PATH-}"
-        fi
-        nohup npm run dev >> "$LOG_DIR/storefront.log" 2>&1 &
-        record_pid storefront "$!" || red "storefront: exited immediately; check: lma logs storefront"
-      )
-    fi
-  fi
+  if [ -d "$ROOT/$BACKEND_DIR" ]; then start_backend; else note "$(label "$BACKEND_NAME") no folder at $BACKEND_DIR, nothing to start"; fi
+  if [ -d "$ROOT/$STOREFRONT_DIR" ]; then start_store; else note "$(label "$STORE_NAME") no folder at $STOREFRONT_DIR, nothing to start"; fi
+  return 0
 }
 
-wait_apps() {
+wait_app() {
   [ "$DRY_RUN" = "1" ] && return 0
-  local app port up pid
-  for app in backend storefront; do
-    case "$app" in backend) port="$LMA_BACKEND_PORT" ;; *) port="$LMA_STOREFRONT_PORT" ;; esac
-    [ -f "$RUN_DIR/$app.pid" ] || continue
-    port_up "$port" && continue
-    note "waiting for $app on :$port ..."
-    up=0
-    for _ in $(seq 1 150); do
-      port_up "$port" && { up=1; break; }
-      app_pid "$app" >/dev/null || break
-      sleep 1
-    done
-    if [ "$up" = "1" ]; then green "$app up on :$port"
-    else red "$app did not come up; check: lma logs $app"; fi
+  local app="$1" port alive=0
+  port="$(app_port "$app")"
+  port_up "$port" && { green "$app up on :$port"; return 0; }
+  { [ "$app" = "$STORE_NAME" ] && [ "$SKIPPED_STORE" = "1" ]; } && return 1
+  note "waiting for $app on :$port ..."
+  for _ in $(seq 1 "${LMA_APP_WAIT:-750}"); do
+    port_up "$port" && { green "$app up on :$port"; return 0; }
+    alive=0
+    app_pid "$app" >/dev/null || break
+    alive=1
+    sleep 0.2
+  done
+  red "$app did not come up; check: lma logs $app"
+  # a watcher outlives the server it runs, and only a file change would start that again
+  [ "$alive" = "1" ] && note "  its process is alive with no server under it: lma restart $app"
+  return 1
+}
+
+# every app, even after one failed: the report should be complete
+wait_apps() {
+  local failed=0
+  [ -d "$ROOT/$BACKEND_DIR" ] && { wait_app "$BACKEND_NAME" || failed=1; }
+  [ -d "$ROOT/$STOREFRONT_DIR" ] && { wait_app "$STORE_NAME" || failed=1; }
+  return "$failed"
+}
+
+stop_app() {
+  local app="$1" pid stale
+  if pid="$(app_pid "$app")"; then
+    if [ "$DRY_RUN" = "1" ]; then plan "kill $app (pid $pid) and its children"; return 0; fi
+    note "stopping $app (pid $pid)"
+    kill_tree "$pid"
+  else
+    stale="$(cat "$RUN_DIR/$app.pid" 2>/dev/null || true)"
+    if [ -n "$stale" ] && kill -0 "$stale" 2>/dev/null; then
+      red "pid $stale is not the $app we started; leaving it alone"
+    fi
+  fi
+  [ "$DRY_RUN" = "1" ] || rm -f "$RUN_DIR/$app.pid" "$RUN_DIR/$app.id"
+}
+
+# the records, not the config: an app renamed while it runs must still stop
+stop_apps() {
+  local f
+  for f in "$RUN_DIR"/*.pid; do
+    [ -e "$f" ] || continue
+    stop_app "$(basename "$f" .pid)"
   done
 }
 
-stop_apps() {
-  local app pid stale
-  for app in backend storefront; do
-    if pid="$(app_pid "$app")"; then
-      if [ "$DRY_RUN" = "1" ]; then plan "kill $app (pid $pid) and its children"; continue; fi
-      note "stopping $app (pid $pid)"
-      kill_tree "$pid"
-    else
-      stale="$(cat "$RUN_DIR/$app.pid" 2>/dev/null || true)"
-      if [ -n "$stale" ] && kill -0 "$stale" 2>/dev/null; then
-        red "pid $stale is not the $app we started; leaving it alone"
-      fi
-    fi
-    [ "$DRY_RUN" = "1" ] || rm -f "$RUN_DIR/$app.pid" "$RUN_DIR/$app.id"
-  done
+restart_app() {
+  local app="$1" dir
+  case "$app" in
+    "$BACKEND_NAME") dir="$BACKEND_DIR" ;;
+    "$STORE_NAME") dir="$STOREFRONT_DIR" ;;
+    *) red "no app named '$app'; this project has: $BACKEND_NAME $STORE_NAME"; exit 1 ;;
+  esac
+  [ -d "$ROOT/$dir" ] || { red "$app has no folder at $dir"; exit 1; }
+  warn_moved_ports
+  stop_app "$app"
+  if [ "$DRY_RUN" = "1" ]; then plan "cd $dir && npm run dev (PORT=$(app_port "$app"))"; return 0; fi
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  if [ "$app" = "$BACKEND_NAME" ]; then start_backend; else start_store; fi
+  wait_app "$app"
+}
+
+# apps on a database with no tables only crash, and the fix is one command away
+require_migrated() {
+  [ -d "$ROOT/$BACKEND_DIR" ] || return 0
+  [ -n "$(admin_count || true)" ] && return 0
+  red "the database '$LMA_DB_NAME' has not been migrated, so the apps were not started"
+  note "  run: lma migrate, then: lma start"
+  exit 1
+}
+
+# off a terminal Medusa's prompts wait for ever: safe actions only, so nothing is ever deleted
+migrate_flags() {
+  [ -t 0 ] && return 0
+  local help
+  help="$(backend_cli db:migrate --help </dev/null 2>/dev/null || true)"
+  case "$help" in
+    *--execute-safe-links*) printf '%s\n' --execute-safe-links ;;
+    *) red "this Medusa has no --execute-safe-links, and its prompt would hang off a terminal; run lma migrate from one" >&2; return 1 ;;
+  esac
+  case "$help" in *--execute-safe-search*) printf '%s\n' --execute-safe-search ;; esac
 }
 
 moved_port() { # $1 = name, $2 = port in use, $3 = allocated, $4 = preferred
@@ -561,10 +687,10 @@ warn_moved_ports() {
   moved_port postgres "$LMA_PG_PORT" "${_P_POSTGRES:-}" "$_C_PG_PORT" && moved=1
   moved_port redis "$LMA_REDIS_PORT" "${_P_REDIS:-}" "$_C_REDIS_PORT" && moved=1
   moved_port proxy "$LMA_HTTP_PORT" "${_P_HTTP:-}" "$_C_HTTP_PORT" && moved=1
-  [ -d "$ROOT/$BACKEND_DIR" ] && moved_port backend "$LMA_BACKEND_PORT" "${_P_BACKEND:-}" "$_C_BACKEND_PORT" && moved=1
-  [ -d "$ROOT/$STOREFRONT_DIR" ] && moved_port storefront "$LMA_STOREFRONT_PORT" "${_P_STOREFRONT:-}" "$_C_STOREFRONT_PORT" && moved=1
+  [ -d "$ROOT/$BACKEND_DIR" ] && moved_port "$BACKEND_NAME" "$LMA_BACKEND_PORT" "${_P_BACKEND:-}" "$_C_BACKEND_PORT" && moved=1
+  [ -d "$ROOT/$STOREFRONT_DIR" ] && moved_port "$STORE_NAME" "$LMA_STOREFRONT_PORT" "${_P_STOREFRONT:-}" "$_C_STOREFRONT_PORT" && moved=1
   [ -z "$moved" ] && return 0
-  dim "  anything naming the old port, such as $BACKEND_DIR/.env, now misses it or reaches another project"
+  dim "  anything naming the old port, such as $BACKEND_DIR/.env or $STOREFRONT_DIR/.env.local, now misses it or reaches another project"
   dim "  once the port is free: lma ports --reset. to keep the new one, set it in the lma config"
 }
 
@@ -591,12 +717,106 @@ confirm_db_loss() {
   confirm "$word" "This destroys the '$LMA_DB_NAME' database ($tables tables) on localhost:$LMA_PG_PORT."
 }
 
+status_report() {
+  local json="$1" ok=1 services="" apps="" svc app port state dir role expected up published=false
+  # with Docker down this has nothing to say, and the apps below still do
+  [ "$json" = "1" ] || "${COMPOSE[@]}" ps || true
+  for svc in postgres redis proxy; do
+    case "$svc" in postgres) port="$LMA_PG_PORT" ;; redis) port="$LMA_REDIS_PORT" ;; *) port="$LMA_HTTP_PORT" ;; esac
+    state="$(service_state "$LMA_COMPOSE_PROJECT-$svc")"
+    if [ "$state" != "healthy" ]; then
+      ok=0
+      [ "$json" = "1" ] || red "$svc is $state"
+    fi
+    services="$services${services:+,}\"$svc\":{\"state\":\"$state\",\"port\":$port}"
+  done
+  for app in "$BACKEND_NAME" "$STORE_NAME"; do
+    port="$(app_port "$app")"
+    if [ "$app" = "$BACKEND_NAME" ]; then dir="$BACKEND_DIR"; role=backend; else dir="$STOREFRONT_DIR"; role=store; fi
+    expected=false; [ -d "$ROOT/$dir" ] && expected=true
+    up=false; port_up "$port" && up=true
+    if [ "$up" = "true" ]; then
+      [ "$json" = "1" ] || [ "$expected" = "false" ] || green "$app up on :$port"
+    elif [ "$expected" = "true" ]; then
+      ok=0
+      [ "$json" = "1" ] || note "$app down (:$port)"
+    fi
+    apps="$apps${apps:+,}\"$app\":{\"role\":\"$role\",\"expected\":$expected,\"up\":$up,\"port\":$port}"
+  done
+  tunnel_up && published=true
+  if [ "$json" = "1" ]; then
+    local result=false
+    [ "$ok" = "1" ] && result=true
+    printf '{"project":"%s","ok":%s,"published":%s,"services":{%s},"apps":{%s}}\n' "$_C_PROJECT" "$result" "$published" "$services" "$apps"
+  elif [ "$published" = "true" ]; then
+    red "published to the internet: lma tunnel status"
+  fi
+  [ "$ok" = "1" ] || exit 1
+}
+
+tunnel_up() {
+  local pid
+  pid="$(cat "$STATE_DIR/tunnel/cloudflared.pid" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+  case "$(ps -p "$pid" -o command= 2>/dev/null || true)" in *"cloudflared tunnel "*) return 0 ;; *) return 1 ;; esac
+}
+
+# left up, a tunnel would publish whatever binds these ports next
+stop_tunnel() {
+  if [ "$DRY_RUN" = "1" ]; then plan "stop this project's tunnel, if one is running"; return 0; fi
+  LMA_ROOT="$ROOT" LMA_ASSETS="$ASSETS" bash "$ASSETS/tunnel.sh" stop --this-folder | { grep -v 'not running' || true; }
+}
+
+# everything lma says here goes to stderr: the command's own output may be going into a pipe
+run_command() {
+  [ "${1:-}" = "--" ] && shift
+  [ "$#" -gt 0 ] || { red "usage: lma run -- <command>" >&2; exit 2; }
+  local pmset="${LMA_PMSET:-pmset}" have_pmset=0 power state started report rc=0 awake=()
+  command -v "$pmset" >/dev/null 2>&1 && have_pmset=1
+  if [ "$have_pmset" = "1" ]; then
+    power="$("$pmset" -g batt 2>/dev/null || true)"
+    case "$power" in *"Battery Power"*) red "on battery: plug in for a long run, a flat battery ends it" >&2 ;; esac
+  fi
+  state="$(service_state "$PG_CONTAINER")"
+  [ "$state" = "healthy" ] || red "postgres is $state; lma start brings it up" >&2
+  export DB_HOST=localhost DB_PORT="$LMA_PG_PORT" DB_USERNAME="$LMA_DB_USER" DB_PASSWORD="$LMA_DB_PASSWORD"
+  DATABASE_URL="$(db_url)"
+  export DATABASE_URL
+  # empty, since dotenv leaves a set variable alone: Medusa's test runner would otherwise take PORT from .env and find the dev server on it
+  export PORT=""
+  command -v caffeinate >/dev/null 2>&1 && awake=(caffeinate -i)
+  cd "${LMA_CALLER_CWD:-$PWD}"
+  started="$(date +%s)"
+  # the report matters most when the command was cut short
+  trap ':' INT TERM
+  ${awake[@]+"${awake[@]}"} "$@" || rc=$?
+  trap - INT TERM
+  if [ "$have_pmset" = "1" ]; then
+    report="$("$pmset" -g log 2>/dev/null | node "$LIB/sleep-log.js" "$started" "$(date +%s)" || true)"
+    if [ -n "$report" ]; then red "$report" >&2; else dim "no sleep during this run" >&2; fi
+  else
+    dim "no pmset here, so the sleep check was skipped" >&2
+  fi
+  exit "$rc"
+}
+
 cmd="${1:-help}"; shift || true
 
 case "$cmd" in
   start|up|stop|down|restart|destroy|db:import|db:dump|db:reset|migrate|seed-admin)
     parse_flags "$@"
     set -- ${ARGS[@]+"${ARGS[@]}"}
+    ;;
+esac
+
+# lma stop backend once took the whole stack down
+case "$cmd" in
+  start|up|stop|down|destroy|db:reset|migrate|seed-admin)
+    if [ "$#" -gt 0 ]; then
+      red "lma $cmd takes no name, and got: $*"
+      note "  one dev server: lma restart <app>"
+      exit 2
+    fi
     ;;
 esac
 
@@ -610,61 +830,80 @@ case "$cmd" in
   start|up)
     [ "$DRY_RUN" = "1" ] || need_docker
     warn_moved_ports
+    warn_weak_secrets
     run "${COMPOSE[@]}" up -d
     [ "$DRY_RUN" = "1" ] || wait_healthy
     note "postgres:   localhost:$LMA_PG_PORT/$LMA_DB_NAME  (url: lma show-env)"
     note "redis:      redis://localhost:$LMA_REDIS_PORT"
-    note "storefront: $LMA_BASE_URL"
-    note "admin:      $LMA_BASE_URL/app  ($LMA_ADMIN_EMAIL — password: lma admin)"
+    note "$(label "$STORE_NAME") $LMA_BASE_URL"
+    note "admin:      $LMA_BASE_URL/app  ($LMA_ADMIN_EMAIL, password: lma admin)"
     if [ "$LMA_DOMAIN" != "localhost" ] && ! grep -q "$LMA_DOMAIN" /etc/hosts 2>/dev/null; then
       red "missing hosts entry; run once:  echo '127.0.0.1 $LMA_DOMAIN' | sudo tee -a /etc/hosts"
     fi
-    [ "$DRY_RUN" = "1" ] || seed_admin auto
+    if [ "$DRY_RUN" != "1" ]; then
+      # the check below reads this stack, and Medusa would write to that other database
+      if guard_database; then seed_admin auto; fi
+      require_migrated
+    fi
     start_apps
     wait_apps
     ;;
   stop|down)
     stop_apps
+    stop_tunnel
     if [ "$DRY_RUN" != "1" ] && ! docker_running; then
       note "docker is not running; nothing to stop"; exit 0
     fi
     run "${COMPOSE[@]}" down
-    note "containers and network removed (volumes kept)"
+    [ "$DRY_RUN" = "1" ] || note "containers and network removed (volumes kept)"
     ;;
   restart)
+    if [ "$#" -gt 0 ]; then
+      restart_app "$1"
+      exit 0
+    fi
     [ "$DRY_RUN" = "1" ] || need_docker
     warn_moved_ports
+    warn_weak_secrets
     stop_apps
     run "${COMPOSE[@]}" down
     run "${COMPOSE[@]}" up -d
     [ "$DRY_RUN" = "1" ] || wait_healthy
+    [ "$DRY_RUN" = "1" ] || require_migrated
     start_apps
     wait_apps
     ;;
   destroy)
     confirm destroy "This DELETES the local database and redis volumes of '$LMA_COMPOSE_PROJECT' permanently." || exit 1
     stop_apps
+    stop_tunnel
     run "${COMPOSE[@]}" down -v
     [ "$DRY_RUN" = "1" ] || green "containers, network and volumes removed"
     ;;
   status|ps)
-    "${COMPOSE[@]}" ps
-    for app in backend storefront; do
-      case "$app" in backend) port="$LMA_BACKEND_PORT" ;; *) port="$LMA_STOREFRONT_PORT" ;; esac
-      if port_up "$port"; then
-        green "$app up on :$port"
-      else
-        note "$app down (:$port)"
-      fi
-    done
+    case "${1:-}" in --json) status_report 1 ;; *) status_report 0 ;; esac
+    ;;
+  run)
+    run_command "$@"
     ;;
   logs)
     case "${1:-}" in
-      backend|storefront)
+      "$BACKEND_NAME"|"$STORE_NAME")
         [ -f "$LOG_DIR/$1.log" ] || { red "no log yet at $LOG_DIR/$1.log"; exit 1; }
-        tail -f "$LOG_DIR/$1.log"
+        if [ "$#" -gt 1 ]; then
+          log_app="$1"; shift
+          node "$LIB/logs.js" "$LOG_DIR/$log_app.log" "$@"
+        else
+          tail -f "$LOG_DIR/$1.log"
+        fi
         ;;
       *)
+        case " $* " in
+          *" --errors "*|*" --since-restart "*)
+            red "--errors and --since-restart only work on an app: $BACKEND_NAME $STORE_NAME"
+            exit 2
+            ;;
+        esac
         "${COMPOSE[@]}" logs -f "$@"
         ;;
     esac
@@ -679,6 +918,7 @@ case "$cmd" in
     ;;
   db:import)
     file="${1:-}"
+    case "$file" in ''|/*) ;; *) file="${LMA_CALLER_CWD:-$PWD}/$file" ;; esac
     [ -n "$file" ] && [ -f "$file" ] || { red "usage: lma import-db <dump.sql|dump.sql.gz|dump.pgcustom> [--yes]"; exit 1; }
     confirm_db_loss import || exit 1
     if [ "$DRY_RUN" = "1" ]; then
@@ -711,10 +951,12 @@ case "$cmd" in
     ;;
   db:dump)
     out="${1:-$DUMP_DIR/$LMA_DB_NAME-$(date +%Y%m%d-%H%M%S).sql.gz}"
+    case "$out" in /*) ;; *) out="${LMA_CALLER_CWD:-$PWD}/$out" ;; esac
     if [ "$DRY_RUN" = "1" ]; then plan "pg_dump '$LMA_DB_NAME' | gzip > $out"; exit 0; fi
     mkdir -p "$DUMP_DIR"
     note "dumping to $out ..."
-    pg_exec pg_dump -U "$LMA_DB_USER" -d "$LMA_DB_NAME" | gzip > "$out"
+    # the whole database: only this user reads it, wherever it was asked to go
+    ( umask 077; pg_exec pg_dump -U "$LMA_DB_USER" -d "$LMA_DB_NAME" | gzip > "$out" )
     green "dump written: $out"
     ;;
   db:reset)
@@ -724,15 +966,23 @@ case "$cmd" in
     ;;
   migrate)
     if [ "$DRY_RUN" = "1" ]; then
-      plan "cd $BACKEND_DIR && npx medusa db:migrate"
+      plan "containers up, then cd $BACKEND_DIR && npx medusa db:migrate"
+      [ -t 0 ] || plan "off a terminal: safe link and search changes only"
       plan "seed the admin if the DB has none"
       exit 0
     fi
+    need_docker
+    "${COMPOSE[@]}" up -d
+    wait_healthy
+    guard_database || exit 1
+    flags="$(migrate_flags)" || exit 1
     note "running Medusa migrations in $BACKEND_DIR..."
-    backend_cli db:migrate
+    # shellcheck disable=SC2086
+    backend_cli db:migrate $flags
     seed_admin
     ;;
   seed-admin)
+    guard_database || exit 1
     seed_admin manual
     ;;
   admin)
@@ -741,11 +991,11 @@ case "$cmd" in
     note "password: $LMA_ADMIN_PASSWORD"
     dim  "          from $ADMIN_PASSWORD_SOURCE"
     # these are the credentials lma would seed; check they exist before saying so
-    if ! docker_running || [ -z "$(admin_count)" ]; then
-      dim  "          (database not reachable; not verified)"
+    if ! docker_running || [ -z "$(admin_count || true)" ]; then
+      dim  "          (database not reachable or not migrated; not verified)"
     elif admin_exists; then
       if [ "$(cat "$STATE_DIR/$SEEDED_FILE_NAME" 2>/dev/null || true)" = "$LMA_ADMIN_EMAIL" ]; then
-        green "this account exists and lma created it with this password"
+        green "this account exists and lma created it; if its password was changed since, this one no longer works"
       else
         note "this account exists, but lma did not create it;"
         note "  the password above is only right if it was set with it"
@@ -761,7 +1011,7 @@ case "$cmd" in
   show-env)
     cat <<EOF
 # add to $BACKEND_DIR/.env
-DATABASE_URL=postgres://$LMA_DB_USER:$LMA_DB_PASSWORD@localhost:$LMA_PG_PORT/$LMA_DB_NAME
+DATABASE_URL=$(db_url)
 REDIS_URL=redis://localhost:$LMA_REDIS_PORT
 
 # set on every 'lma start'; CORS is merged with your .env, so copying is not needed.
@@ -773,7 +1023,12 @@ ADMIN_CORS=$_CORS_ADMIN
 AUTH_CORS=$_CORS_AUTH
 EOF
     ;;
-  help|*)
+  help|-h|--help)
     usage
+    ;;
+  *)
+    red "unknown command '$cmd'" >&2
+    usage >&2
+    exit 2
     ;;
 esac

@@ -1,3 +1,7 @@
+.agents/
+.claude/
+.idea/
+.vscode/
 node_modules/
 *.tgz
 .DS_Store

@@ -1,0 +1,19 @@
+#!/usr/bin/env node
+// Stand-in for pmset: the power source, and a log in the real format.
+const argv = process.argv.slice(2)
+const env = process.env
+
+const stamp = (ms) => new Date(ms).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' +0000')
+
+if (argv[1] === 'batt') process.stdout.write(`Now drawing from '${env.LMA_TEST_POWER || 'AC Power'}'\n`)
+
+if (argv[1] === 'log') {
+    const now = Date.now()
+    const line = (ms, kind, text) => process.stdout.write(`${stamp(ms)} ${kind.padEnd(20)}\t${text}\n`)
+    line(now - 3600000, 'Sleep', "Entering Sleep state due to 'Idle Sleep':TCPKeepAlive=active")
+    line(now - 3500000, 'Wake', 'DarkWake to FullWake')
+    if (env.LMA_TEST_SLEPT) {
+        line(now - 1000, 'Sleep', `Entering Sleep state due to '${env.LMA_TEST_SLEPT}':TCPKeepAlive=active`)
+        line(now, 'Wake', 'DarkWake to FullWake')
+    }
+}

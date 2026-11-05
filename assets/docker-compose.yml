@@ -24,7 +24,7 @@ services:
     image: ${LMA_PROXY_IMAGE:-nginx:1.31.4-alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913}
     container_name: ${LMA_COMPOSE_PROJECT:-app}-proxy
     ports:
-      - "${LMA_HTTP_PORT:-80}:80"
+      - "127.0.0.1:${LMA_HTTP_PORT:-80}:80"
     volumes:
       - ./nginx.conf:/etc/nginx/templates/default.conf.template:ro
     environment:
