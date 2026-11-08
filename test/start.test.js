@@ -192,15 +192,51 @@ const holdPort = async (port) => {
 
 const movedLine = (name, port) => new RegExp(`${name} is on :${port + 1}, not its preferred :${port}`)
 
-test('start says a port moved, since a hardcoded .env now reaches something else', async () => {
+test('start says a port moved, and rewrites it in the backend .env, leaving the rest of the file alone', async () => {
     const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    const file = path.join(dir, 'apps', 'backend', '.env')
+    fs.writeFileSync(file, `DATABASE_URL=postgres://demo:demo@localhost:${PORTS.postgres}/demo_db\nREDIS_URL=redis://localhost:${PORTS.redis}\nJWT_SECRET=keep-this-one-as-it-is\n`)
     const release = await holdPort(PORTS.postgres)
     try {
         const r = local(['start'], { cwd: dir })
         assert.strictEqual(r.status, 0, r.out)
         assert.match(r.out, movedLine('postgres', PORTS.postgres))
-        assert.match(r.out, /apps\/backend\/\.env/)
+        assert.match(r.out, /rewrote apps\/backend\/\.env: DATABASE_URL$/m)
         assert.match(r.out, /lma ports --reset/)
+        const env = fs.readFileSync(file, 'utf8')
+        assert.match(env, new RegExp(`^DATABASE_URL=postgres://demo:demo@localhost:${PORTS.postgres + 1}/demo_db$`, 'm'))
+        assert.match(env, new RegExp(`^REDIS_URL=redis://localhost:${PORTS.redis}$`, 'm'), 'a key that still holds stays as it is')
+        assert.match(env, /^JWT_SECRET=keep-this-one-as-it-is$/m)
+        assert.doesNotMatch(local(['start'], { cwd: dir }).out, /rewrote/, 'nothing to rewrite the second time')
+    } finally { await release() }
+})
+
+test('a store .env.local naming the old backend port is rewritten too, and the rest of it kept', async () => {
+    const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'storefront'), { recursive: true })
+    const file = path.join(dir, 'apps', 'storefront', '.env.local')
+    fs.writeFileSync(file, `NEXT_PUBLIC_MEDUSA_BACKEND_URL=http://localhost:${PORTS.backend}\nNEXT_PUBLIC_DEFAULT_REGION=dk\n`)
+    const release = await holdPort(PORTS.backend)
+    try {
+        const r = local(['start'], { cwd: dir })
+        assert.strictEqual(r.status, 0, r.out)
+        assert.match(r.out, /rewrote apps\/storefront\/\.env\.local: NEXT_PUBLIC_MEDUSA_BACKEND_URL$/m)
+        const env = fs.readFileSync(file, 'utf8')
+        assert.match(env, new RegExp(`^NEXT_PUBLIC_MEDUSA_BACKEND_URL=http://localhost:${PORTS.backend + 1}$`, 'm'))
+        assert.match(env, /^NEXT_PUBLIC_DEFAULT_REGION=dk$/m)
+        assert.strictEqual(devEnv(dir, 'apps/storefront').NEXT_PUBLIC_MEDUSA_BACKEND_URL, `http://localhost:${PORTS.backend + 1}`)
+    } finally { await release() }
+})
+
+test('a dry run rewrites nothing, and a missing env file is not created', async () => {
+    const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    const release = await holdPort(PORTS.postgres)
+    try {
+        assert.doesNotMatch(local(['start', '--dry-run'], { cwd: dir }).out, /rewrote/)
+        assert.strictEqual(local(['start'], { cwd: dir }).status, 0)
+        assert.ok(!fs.existsSync(path.join(dir, 'apps', 'backend', '.env')))
     } finally { await release() }
 })
 
@@ -277,8 +313,7 @@ test('help documents the safety flags', () => {
     const r = local(['help'], { cwd: project() })
     assert.match(r.out, /--dry-run +print what would happen; starts, stops and deletes nothing/)
     assert.match(r.out, /--yes +skip the confirmation prompt/)
-    assert.match(r.out, /secrets, dumps, logs and pids live in ~\/\.local-medusa-app\/<project>\//)
-    assert.match(r.out, /ports in node_modules\/\.local-medusa-app-cache\//)
+    assert.match(r.out, /secrets, dumps, logs, pids and the port map live in ~\/\.local-medusa-app\/<project>\//)
 })
 
 test('start on an unmigrated database says what to run and starts no apps', () => {
@@ -439,13 +474,14 @@ test('the proxy, like Postgres and Redis, listens on this machine only', () => {
     for (const line of published) assert.ok(line.startsWith('127.0.0.1:'), line)
 })
 
-test('what the store sets in .env.local stays its own, whatever is in the database', () => {
+test('what the store sets in .env.local stays its own, apart from the backend url, which is lma\'s', () => {
     const dir = appsOnDisk()
     fs.writeFileSync(path.join(dir, 'apps', 'storefront', '.env.local'), 'NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY=pk_chosen\nMEDUSA_BACKEND_URL=https://staging.test\nNEXT_PUBLIC_BASE_PATH=/shop\n')
     assert.strictEqual(local(['start'], { cwd: dir }).status, 0)
     const env = devEnv(dir, 'apps/storefront')
-    for (const key of ['NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY', 'MEDUSA_BACKEND_URL', 'NEXT_PUBLIC_BASE_PATH']) assert.strictEqual(env[key], undefined, key)
-    assert.strictEqual(env.NEXT_PUBLIC_MEDUSA_BACKEND_URL, `http://localhost:${PORTS.backend}`, 'and lma fills in the rest')
+    for (const key of ['NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY', 'NEXT_PUBLIC_BASE_PATH']) assert.strictEqual(env[key], undefined, key)
+    assert.strictEqual(env.MEDUSA_BACKEND_URL, `http://localhost:${PORTS.backend}`, 'the store talks to this stack, whatever the file says')
+    assert.strictEqual(env.NEXT_PUBLIC_MEDUSA_BACKEND_URL, `http://localhost:${PORTS.backend}`)
 })
 
 test('a key only in .env.local is enough to start the store', () => {
@@ -569,6 +605,6 @@ test('ports --json gives the map, the preferred ports and what moved', async () 
         assert.strictEqual(json.ports.redis, PORTS.redis + 1)
         assert.strictEqual(json.preferred.redis, PORTS.redis)
         assert.deepStrictEqual(json.moved, ['redis'])
-        assert.match(json.cache, /ports\.json$/)
+        assert.match(json.pins, /ports\.json$/)
     } finally { await new Promise((res) => srv.close(res)) }
 })

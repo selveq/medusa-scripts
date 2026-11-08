@@ -383,11 +383,11 @@ test('stop stays quiet when no tunnel is up', () => {
     assert.doesNotMatch(local(['stop'], { cwd: project(HOSTS) }).out, /[Tt]unnel/)
 })
 
-test('hostnames save for an app whose name has a hyphen', () => {
-    const dir = project({ apps: { backend: null, 'my-api': { role: 'backend', port: PORTS.backend } } })
-    require('../lib/confedit.js').setHostnames(dir, { 'my-api': 'api.example.test' })
+test('hostnames save for a store whose name has a hyphen', () => {
+    const dir = project({ apps: { 'my-shop': { port: PORTS.storefront + 1 } } })
+    require('../lib/confedit.js').setHostnames(dir, { 'my-shop': 'shop.example.test' })
     delete require.cache[require.resolve(path.join(dir, 'lma.js'))]
-    assert.strictEqual(require(path.join(dir, 'lma.js')).tunnel.hostnames['my-api'], 'api.example.test')
+    assert.strictEqual(require(path.join(dir, 'lma.js')).tunnel.hostnames['my-shop'], 'shop.example.test')
 })
 
 test('the weak-admin refusal can be overridden deliberately', async () => {

@@ -4,7 +4,9 @@ const fs = require('node:fs')
 
 const argv = process.argv.slice(2)
 const log = process.env.LMA_TEST_NPX_LOG
-if (log) fs.appendFileSync(log, JSON.stringify({ argv, cwd: process.cwd(), tty: Boolean(process.stdin.isTTY), at: process.hrtime.bigint().toString() }) + '\n')
+// the connection lma hands Medusa's CLI, so a test can see where a migration would go
+const env = Object.fromEntries(['DATABASE_URL', 'REDIS_URL'].filter((k) => k in process.env).map((k) => [k, process.env[k]]))
+if (log) fs.appendFileSync(log, JSON.stringify({ argv, cwd: process.cwd(), env, tty: Boolean(process.stdin.isTTY), at: process.hrtime.bigint().toString() }) + '\n')
 
 // the real npx, told a package by a parent npx, looks for its command inside that package
 if (process.env.npm_config_package) {

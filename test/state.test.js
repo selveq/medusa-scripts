@@ -75,8 +75,8 @@ test('logs an older lma left in the install cache move out, where the dev server
     writeOldLog(dir, 'backend.log', 'an order for someone@example.test\n')
     const r = local(['show-env'], { cwd: dir })
     assert.strictEqual(r.status, 0, r.out)
-    assert.match(r.out, /moved the old logs to /)
-    assert.ok(!fs.existsSync(oldLogs(dir)), 'nothing is left in the project')
+    assert.match(r.out, /moved the old logs and port map to /)
+    assert.ok(!fs.existsSync(cache(dir)), 'nothing is left in the project')
     assert.strictEqual(fs.readFileSync(paths.sub(dir, 'logs', 'backend.log'), 'utf8'), 'an order for someone@example.test\n')
     assert.doesNotMatch(local(['show-env'], { cwd: dir }).out, /moved the old logs/, 'it says so once')
 })
@@ -108,12 +108,25 @@ test('a server still writing to an old log keeps writing to the moved file', () 
     assert.strictEqual(fs.readFileSync(paths.sub(dir, 'logs', 'backend.log'), 'utf8'), 'before\nafter\n')
 })
 
-test('the move leaves the port map where it is', async () => {
+test('a port map 0.3.0 left in the install cache moves out, and its ports are found again', async () => {
+    const dir = project()
+    fs.mkdirSync(cache(dir), { recursive: true })
+    fs.writeFileSync(cache(dir, 'ports.json'), JSON.stringify({ ports: { postgres: PORTS.postgres + 3 }, bases: { postgres: PORTS.postgres } }))
+    paths.ensure(dir)
+    assert.ok(!fs.existsSync(cache(dir)))
+    assert.ok(fs.existsSync(state(dir, 'ports.json')))
+    assert.strictEqual((await ports.resolve(dir)).ports.postgres, PORTS.postgres, 'a pin under the old format is let go')
+})
+
+test('a port map already in the state folder is never overwritten by an old one', async () => {
     const dir = project()
     await ports.resolve(dir)
-    writeOldLog(dir, 'backend.log', 'x\n')
+    const before = fs.readFileSync(state(dir, 'ports.json'), 'utf8')
+    fs.mkdirSync(cache(dir), { recursive: true })
+    fs.writeFileSync(cache(dir, 'ports.json'), '{"ports":{"postgres":1}}')
     paths.ensure(dir)
-    assert.ok(fs.existsSync(cache(dir, 'ports.json')))
+    assert.strictEqual(fs.readFileSync(state(dir, 'ports.json'), 'utf8'), before)
+    assert.ok(!fs.existsSync(cache(dir)))
 })
 
 test('an old folder beside a new one is called out and never merged', () => {
@@ -130,12 +143,12 @@ test('an old folder beside a new one is called out and never merged', () => {
 const state = (dir, ...p) => paths.sub(dir, ...p)
 const cache = (dir, ...p) => path.join(dir, 'node_modules', '.local-medusa-app-cache', ...p)
 
-test('the port map lives in the install cache', () => {
+test('the port map lives in the state folder, beside the secrets, and nothing of lma\'s goes in the install', async () => {
     const dir = project()
-    paths.ensure(dir)
-    assert.strictEqual(paths.cacheDir(dir), cache(dir))
-    assert.strictEqual(ports.cachePath(dir), cache(dir, 'ports.json'))
-    assert.ok(fs.existsSync(cache(dir)))
+    assert.strictEqual(ports.pinPath(dir), state(dir, 'ports.json'))
+    await ports.resolve(dir)
+    assert.ok(fs.existsSync(state(dir, 'ports.json')))
+    assert.ok(!fs.existsSync(path.join(dir, 'node_modules')))
 })
 
 test('secrets, dumps and pids stay out of node_modules', () => {
@@ -144,18 +157,11 @@ test('secrets, dumps and pids stay out of node_modules', () => {
     assert.ok(!secrets.ensure(dir).file.includes('node_modules'), 'a wiped install must not take them')
 })
 
-test('the port map is pinned in the cache until --reset', async () => {
+test('the port map is pinned in the state folder until --reset', async () => {
     const dir = project()
     const first = await ports.resolve(dir)
-    assert.ok(fs.existsSync(cache(dir, 'ports.json')))
+    assert.ok(fs.existsSync(state(dir, 'ports.json')))
     assert.deepStrictEqual((await ports.resolve(dir)).ports, first.ports)
-})
-
-test('a port map from before 0.3.0 still pins', async () => {
-    const dir = project()
-    paths.ensure(dir)
-    fs.writeFileSync(cache(dir, 'ports.json'), JSON.stringify({ postgres: PORTS.postgres + 3 }))
-    assert.strictEqual((await ports.resolve(dir)).ports.postgres, PORTS.postgres + 3)
 })
 
 test('a port edited in the config replaces the pin made for the old one', async () => {
@@ -164,13 +170,45 @@ test('a port edited in the config replaces the pin made for the old one', async 
     const file = path.join(dir, 'lma.js')
     fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(String(PORTS.redis), String(PORTS.redis + 2)))
     delete require.cache[require.resolve(file)]
-    const { ports: map, bases } = await ports.resolve(dir)
+    const { ports: map, preferred } = await ports.resolve(dir)
     assert.strictEqual(map.redis, PORTS.redis + 2)
-    assert.strictEqual(bases.redis, PORTS.redis + 2)
+    assert.strictEqual(preferred.redis, PORTS.redis + 2)
+})
+
+test('a port pinned by another project on this machine is taken, even while that stack is down', async () => {
+    const first = project()
+    const second = project()
+    const a = (await ports.resolve(first)).ports
+    const b = (await ports.resolve(second)).ports
+    for (const svc of Object.keys(a)) assert.strictEqual(b[svc], a[svc] + 1, `${svc} keeps away from the other project's pin`)
+    assert.deepStrictEqual((await ports.resolve(first)).ports, a, 'the first project keeps its own pins')
+    assert.deepStrictEqual((await ports.resolve(second)).ports, b, 'and so does the second')
+})
+
+test('a pin left by a project that is gone still holds its ports, until its state folder goes', async () => {
+    const dir = project()
+    const gone = path.join(paths.home(), 'deleted-project-1')
+    fs.mkdirSync(gone, { recursive: true })
+    fs.writeFileSync(path.join(gone, 'ports.json'), JSON.stringify({ ports: { postgres: PORTS.postgres } }))
+    try {
+        assert.strictEqual((await ports.resolve(dir)).ports.postgres, PORTS.postgres + 1)
+    } finally { fs.rmSync(gone, { recursive: true, force: true }) }
+    assert.strictEqual((await ports.resolve(dir, { reset: true })).ports.postgres, PORTS.postgres)
+})
+
+test('a port taken out of the config lets its pin go, and the band decides again', async () => {
+    const dir = project()
+    await ports.resolve(dir)
+    const file = path.join(dir, 'lma.js')
+    fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(`"port": ${PORTS.redis}`, '"port": null'))
+    delete require.cache[require.resolve(file)]
+    const { ports: map, preferred } = await ports.resolve(dir)
+    assert.ok(map.redis >= ports.BANDS.redis[0] && map.redis <= ports.BANDS.redis[1], String(map.redis))
+    assert.strictEqual(preferred.redis, undefined)
 })
 
 test('a port written as a string is still a number', async () => {
-    const dir = project({ apps: { backend: { dir: 'apps/backend', port: String(PORTS.backend) } } })
+    const dir = project({ apps: { backend: { port: String(PORTS.backend) } } })
     const release = await holdAppPort(dir, 'stranger', PORTS.backend)
     try {
         const { ports: map } = await ports.resolve(dir)
@@ -183,11 +221,11 @@ test('reading never moves a port: only what brings the stack up may', async () =
     const { ports: first } = await ports.resolve(dir)
     const release = await holdAppPort(dir, 'stranger', PORTS.backend)
     try {
-        const before = fs.readFileSync(cache(dir, 'ports.json'), 'utf8')
+        const before = fs.readFileSync(state(dir, 'ports.json'), 'utf8')
         for (const args of [['status'], ['show-env'], ['admin'], ['start', '--dry-run'], ['stop'], ['tunnel', 'status']]) {
             if (args[0] === 'tunnel') tunnel(args.slice(1), { cwd: dir })
             else local(args, { cwd: dir })
-            assert.strictEqual(fs.readFileSync(cache(dir, 'ports.json'), 'utf8'), before, args.join(' '))
+            assert.strictEqual(fs.readFileSync(state(dir, 'ports.json'), 'utf8'), before, args.join(' '))
         }
         assert.strictEqual(first.backend, PORTS.backend)
     } finally { await release() }
@@ -196,7 +234,7 @@ test('reading never moves a port: only what brings the stack up may', async () =
 test('a dry run on a new project writes no port map', () => {
     const dir = project()
     assert.strictEqual(local(['start', '--dry-run'], { cwd: dir }).status, 0)
-    assert.ok(!fs.existsSync(cache(dir, 'ports.json')))
+    assert.ok(!fs.existsSync(state(dir, 'ports.json')))
 })
 
 test('a port held by this stack\'s own container stays where it is', async () => {
@@ -219,21 +257,22 @@ test('ports --reset refuses while the stack runs, since it would stay on the old
 test('ports --reset --dry-run changes nothing', async () => {
     const dir = project()
     paths.ensure(dir)
-    fs.writeFileSync(cache(dir, 'ports.json'), JSON.stringify({ postgres: PORTS.postgres + 3 }))
+    const pinned = JSON.stringify({ ports: { postgres: PORTS.postgres + 3 }, preferred: { postgres: PORTS.postgres } })
+    fs.writeFileSync(state(dir, 'ports.json'), pinned)
     cli(['ports', '--reset', '--dry-run'], { cwd: dir })
-    assert.strictEqual(JSON.parse(fs.readFileSync(cache(dir, 'ports.json'), 'utf8')).postgres, PORTS.postgres + 3)
+    assert.strictEqual(fs.readFileSync(state(dir, 'ports.json'), 'utf8'), pinned)
 })
 
-test('a wiped node_modules costs the port map, never the secrets', async () => {
+test('a wiped node_modules costs neither the port map nor the secrets', async () => {
     const dir = project()
+    fs.mkdirSync(path.join(dir, 'node_modules', 'something'), { recursive: true })
     const before = secrets.ensure(dir).values.LMA_ADMIN_PASSWORD
-    await ports.resolve(dir)
-    assert.ok(fs.existsSync(cache(dir, 'ports.json')))
+    const first = (await ports.resolve(dir)).ports
 
     fs.rmSync(path.join(dir, 'node_modules'), { recursive: true, force: true })
 
     assert.strictEqual(secrets.ensure(dir).values.LMA_ADMIN_PASSWORD, before, 'the admin login survives')
-    assert.ok(fs.existsSync(state(dir, 'secrets.env')))
+    assert.deepStrictEqual((await ports.resolve(dir, { frozen: true })).ports, first, 'and so do the ports')
 })
 
 test('secrets are generated once, kept private, and reused', () => {

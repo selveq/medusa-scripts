@@ -98,30 +98,37 @@ test('seeding prints no password when the output may be going into a log', () =>
     assert.ok(!r.out.includes(LMA_ADMIN_PASSWORD))
 })
 
-for (const [why, env, write] of [
-    ['a moved port left in the backend .env', {}, `DATABASE_URL=postgres://medusa:medusa@localhost:${PORTS.postgres + 7}/medusa-backend\n`],
-    ['an export in the shell', { DATABASE_URL: 'postgres://deploy:x@prod.example.com/shop' }, ''],
-]) {
-    test(`migrate and seed-admin refuse a database that is not this stack's: ${why}`, () => {
-        const dir = project()
-        fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
-        fs.writeFileSync(path.join(dir, 'apps', 'backend', '.env'), write)
-        for (const command of ['migrate', 'seed-admin']) {
-            const r = local([command], { cwd: dir, env: { ...db(0, 0), ...env } })
-            assert.notStrictEqual(r.status, 0, command)
-            assert.match(r.out, /points at .*, and this stack's Postgres is on localhost:\d+/)
-            assert.ok(!r.out.includes(dir), 'the message names the file from the project root')
-            assert.ok(!r.out.includes('deploy:x'), 'the url credentials stay out of the message')
-        }
-        assert.ok(!npxRuns(dir).some((run) => run.argv.includes('user') || (run.argv.includes('db:migrate') && !run.argv.includes('--help'))))
-    })
-}
+const ELSEWHERE = { DATABASE_URL: 'postgres://deploy:x@prod.example.com/shop' }
 
-test('start warns about that database and seeds nothing into it', () => {
+test('migrate and seed-admin refuse a DATABASE_URL exported for a database that is not this stack\'s', () => {
     const dir = project()
     fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
-    fs.writeFileSync(path.join(dir, 'apps', 'backend', '.env'), `DATABASE_URL=postgres://medusa:medusa@localhost:${PORTS.postgres + 7}/medusa-backend\n`)
-    const r = local(['start'], { cwd: dir, env: db(0, 0) })
+    for (const command of ['migrate', 'seed-admin']) {
+        const r = local([command], { cwd: dir, env: { ...db(0, 0), ...ELSEWHERE } })
+        assert.notStrictEqual(r.status, 0, command)
+        assert.match(r.out, /DATABASE_URL in your shell points at prod\.example\.com:5432, and this stack's Postgres is on localhost:\d+/)
+        assert.ok(!r.out.includes('deploy:x'), 'the url credentials stay out of the message')
+    }
+    assert.ok(!npxRuns(dir).some((run) => run.argv.includes('user') || (run.argv.includes('db:migrate') && !run.argv.includes('--help'))))
+})
+
+test('a moved port left in the backend .env is rewritten before migrate runs, since that key is lma\'s', () => {
+    const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    const file = path.join(dir, 'apps', 'backend', '.env')
+    fs.writeFileSync(file, `DATABASE_URL=postgres://medusa:medusa@localhost:${PORTS.postgres + 7}/medusa-backend\n`)
+    const r = local(['migrate'], { cwd: dir, env: { ...db(1, 1) } })
+    assert.strictEqual(r.status, 0, r.out)
+    assert.match(r.out, /rewrote apps\/backend\/\.env: DATABASE_URL/)
+    assert.match(fs.readFileSync(file, 'utf8'), new RegExp(`^DATABASE_URL=postgres://demo:demo@localhost:${PORTS.postgres}/demo_db$`, 'm'))
+    const migrated = npxRuns(dir).find((run) => run.argv.includes('db:migrate') && !run.argv.includes('--help'))
+    assert.strictEqual(migrated.env.DATABASE_URL, `postgres://demo:demo@localhost:${PORTS.postgres}/demo_db`, 'and Medusa is pointed at this stack')
+})
+
+test('start warns about a database exported elsewhere and seeds nothing into it', () => {
+    const dir = project()
+    fs.mkdirSync(path.join(dir, 'apps', 'backend'), { recursive: true })
+    const r = local(['start'], { cwd: dir, env: { ...db(0, 0), ...ELSEWHERE } })
     assert.match(r.out, /this stack's Postgres is on localhost/)
     assert.ok(!npxRuns(dir).some((run) => run.argv.includes('user')))
 })

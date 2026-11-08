@@ -91,9 +91,25 @@ test('a hostname that could not be written back leaves the file as it was', () =
 })
 
 test('ports fall back to the preferred value when it is free', async () => {
-    const { ports: p, bases } = await ports.resolve(project())
-    assert.strictEqual(p.postgres, bases.postgres)
-    assert.strictEqual(p.redis, bases.redis)
+    const { ports: p, preferred } = await ports.resolve(project())
+    assert.strictEqual(p.postgres, preferred.postgres)
+    assert.strictEqual(p.redis, preferred.redis)
+})
+
+test('with no port in the config, each service takes the first free port in its band', async () => {
+    const dir = project({ services: { postgres: { port: null }, redis: { port: null } }, apps: { backend: { port: null }, storefront: { port: null } }, proxy: { port: null } })
+    const { ports: p, preferred } = await ports.resolve(dir)
+    assert.deepStrictEqual(preferred, {}, 'nothing was asked for')
+    for (const [svc, [from, to]] of [['postgres', ports.BANDS.postgres], ['redis', ports.BANDS.redis], ['http', ports.BANDS.http], ['backend', ports.BANDS.backend], ['storefront', ports.BANDS.store]]) {
+        assert.ok(p[svc] >= from && p[svc] <= to, `${svc} on ${p[svc]}`)
+    }
+})
+
+test('a second store takes the next free port in the store band', async () => {
+    const dir = project({ apps: { storefront: { port: null }, web: {}, kiosk: {} } })
+    const { ports: p } = await ports.resolve(dir)
+    assert.ok(p.web >= ports.BANDS.store[0])
+    assert.strictEqual(p.kiosk, p.web + 1)
 })
 
 test('a busy port moves the service to the next free one', async () => {

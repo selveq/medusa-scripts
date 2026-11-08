@@ -76,15 +76,15 @@ test('the tunnel hostnames go in at start, so tunnel start needs no restart', ()
     )
 })
 
-test('a backend with its own .env keeps owning it, bar the two lma fills in', () => {
+test('a backend with its own .env keeps its secrets, and gets the hosts, CORS and connection lma owns', () => {
     const dir = withBackend({ proxy: { domain: 'valadio.local' } })
     fs.writeFileSync(path.join(dir, 'apps', 'backend', '.env'), 'DATABASE_URL=postgres://mine/db\n')
     local(['start'], { cwd: dir })
     const env = devEnv(dir, 'backend')
     assert.strictEqual(env.__MEDUSA_ADMIN_ADDITIONAL_ALLOWED_HOSTS, 'valadio.local')
     assert.ok(env.STORE_CORS.includes('http://valadio.local'), 'CORS is filled in too')
-    assert.strictEqual(env.DATABASE_URL, undefined, 'everything else is still the app\'s')
-    assert.strictEqual(env.JWT_SECRET, undefined)
+    assert.strictEqual(env.DATABASE_URL, `postgres://demo:demo@localhost:${PORTS.postgres}/demo_db`, 'this stack, whatever the .env says')
+    assert.strictEqual(env.JWT_SECRET, undefined, 'the secrets are still the app\'s')
 })
 
 test('a host set in the environment survives alongside the configured ones', () => {

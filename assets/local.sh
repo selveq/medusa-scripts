@@ -14,9 +14,9 @@ Local stack for '${LMA_COMPOSE_PROJECT:-<project>}' (config: lma.js / lma.cjs; i
                          (--backend <name> --store <name> answers without asking; --yes starts Docker)
                          in an existing project: scaffold the config + the 'lma' npm alias
                          (--scripts adds an alias per command, --no-scripts adds none)
-  lma start              start Docker if needed, infra containers, then both dev servers
+  lma start              start Docker if needed, infra containers, then every dev server
   lma stop               remove containers + network (data volumes kept)
-  lma restart            recreate the containers, then both dev servers
+  lma restart            recreate the containers, then every dev server
   lma restart <app>      restart that dev server only, docker untouched
   lma destroy            remove containers AND volumes (asks confirmation)
   lma status [--json]    show container and app state; exits non zero when one is down
@@ -35,7 +35,7 @@ Local stack for '${LMA_COMPOSE_PROJECT:-<project>}' (config: lma.js / lma.cjs; i
   lma admin              print the admin URL, email and password
   lma show-env           print DATABASE_URL/REDIS_URL lines for the backend .env
   lma ports [--reset] [--json]
-                         show / reallocate the closest available port map
+                         show / reallocate the port map: the first free port in each band
   lma tunnel             Cloudflare tunnel (setup/start/quick/stop/status/logs)
   lma --version          print the installed version
 
@@ -43,8 +43,8 @@ Flags on start/stop/restart/destroy/migrate/seed-admin and the db commands:
   -n, --dry-run          print what would happen; starts, stops and deletes nothing
   -y, --yes              skip the confirmation prompt (required when not on a tty)
 
-  secrets, dumps, logs and pids live in ~/.local-medusa-app/<project>/, out of reach of the
-  admin's dev server; ports in node_modules/.local-medusa-app-cache/ (regenerated after a clean install)
+  secrets, dumps, logs, pids and the port map live in ~/.local-medusa-app/<project>/, out of
+  reach of the admin's dev server
   run via npx lma, npm run lma <cmd>, or bare lma inside npm scripts
 EOF
 }
@@ -134,19 +134,17 @@ console.log([
   `_C_PROJECT=${q(proj)}`,
   `_C_PROJECT_ID=${q(lib.projectId(root, c))}`,
   `_C_STATE_DIR=${q(require("node:path").dirname(sec.file))}`,
-  `_C_PG_PORT=${q(p.port || 5432)}`,
+  `_C_PG_PORT=${q(p.port || "")}`,
   `_C_DB_USER=${q(p.user || "app")}`,
   `_C_DB_PASSWORD=${q(p.password || "app")}`,
   `_C_DB_NAME=${q(p.database || proj)}`,
-  `_C_REDIS_PORT=${q(r.port || 6379)}`,
-  `_C_HTTP_PORT=${q(x.port || 80)}`,
+  `_C_REDIS_PORT=${q(r.port || "")}`,
+  `_C_HTTP_PORT=${q(x.port || "")}`,
   `_C_DOMAIN=${q(x.domain || "localhost")}`,
   `_C_BACKEND_NAME=${q(ap.backend.name)}`,
   `_C_BACKEND_DIR=${q(ap.backend.dir)}`,
-  `_C_BACKEND_PORT=${q(ap.backend.port)}`,
-  `_C_STORE_NAME=${q(ap.store.name)}`,
-  `_C_STOREFRONT_PORT=${q(ap.store.port)}`,
-  `_C_STOREFRONT_DIR=${q(ap.store.dir)}`,
+  `_C_MAIN_STORE=${q(ap.main)}`,
+  `_C_APPS=${q([ap.backend, ...ap.stores].map((a) => [a.name, a.dir, a.role, a.port || ""].join("\t")).join("\n"))}`,
   `_C_ADMIN_EMAIL=${q(ad.email || "admin@" + proj + ".local")}`,
   `_C_ADMIN_PASSWORD=${q(ad.password || "")}`,
   `_C_WEAK_SECRETS=${q(secrets.weakAppSecrets(root, ap.backend.dir).join(" "))}`,
@@ -175,6 +173,19 @@ RUN_DIR="$STATE_DIR/run"
 LOCK_DIR="$STATE_DIR/lock"
 LOG_DIR="$STATE_DIR/logs"
 
+# the apps, one row each: name, folder, role, port asked for in the config; the backend first
+app_rows() { printf '%s\n' "$_C_APPS"; }
+app_names() { app_rows | cut -f1; }
+store_names() { app_rows | awk -F'\t' '$3 == "store" { print $1 }'; }
+app_field() { app_rows | awk -F'\t' -v a="$1" -v f="$2" '$1 == a { print $f; exit }'; }
+app_dir() { app_field "$1" 2; }
+app_role() { app_field "$1" 3; }
+app_cfg_port() { app_field "$1" 4; }
+app_known() { [ -n "$(app_field "$1" 1)" ]; }
+# app keys may hold chars that are invalid in a shell variable name (admin-ui)
+shell_name() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9_]/_/g'; }
+app_port() { local v; v="_P_$(shell_name "$1")"; printf '%s' "${!v:-}"; }
+
 # ports, plus the two values derived from them: allowed hosts and CORS origins
 _C_ALLOWED_HOSTS=""
 _CORS_STORE=""; _CORS_ADMIN=""; _CORS_AUTH=""
@@ -189,12 +200,10 @@ if _pmap="$(node -e '
   const envfile = require(process.argv[6])
   const c = cfg.load(root)
   const q = (v) => "\x27" + String(v).replace(/\x27/g, "\x27\\\x27\x27") + "\x27"
-  // app keys may hold chars that are invalid in a shell variable name (admin-ui)
+  // the same rule shell_name applies above
   const shellName = (k) => k.toUpperCase().replace(/[^A-Z0-9_]/g, "_")
   const out = Object.entries(ports).map(([k, v]) => `_P_${shellName(k)}=${v}`)
   const ap = cfg.apps(c)
-  if (ports[ap.backend.name]) out.push(`_P_BACKEND=${ports[ap.backend.name]}`)
-  if (ports[ap.store.name]) out.push(`_P_STOREFRONT=${ports[ap.store.name]}`)
   const inherited = hosts.merge(process.env[hosts.ENV_VAR], hosts.adminAllowedHosts(c))
   out.push(`_C_ALLOWED_HOSTS=${q(inherited.join(","))}`)
   // merge with the backend .env so lma only ever adds origins
@@ -216,19 +225,23 @@ fi
 rm -f "$_ports_err"
 
 export LMA_COMPOSE_PROJECT="${LMA_COMPOSE_PROJECT:-$_C_PROJECT${_C_PROJECT_ID:+-$_C_PROJECT_ID}}"
-export LMA_PG_PORT="${LMA_PG_PORT:-${_P_POSTGRES:-$_C_PG_PORT}}"
+export LMA_PG_PORT="${LMA_PG_PORT:-$_P_POSTGRES}"
 export LMA_DB_USER="${LMA_DB_USER:-$_C_DB_USER}"
 export LMA_DB_PASSWORD="${LMA_DB_PASSWORD:-$_C_DB_PASSWORD}"
 export LMA_DB_NAME="${LMA_DB_NAME:-$_C_DB_NAME}"
-export LMA_REDIS_PORT="${LMA_REDIS_PORT:-${_P_REDIS:-$_C_REDIS_PORT}}"
-export LMA_HTTP_PORT="${LMA_HTTP_PORT:-${_P_HTTP:-$_C_HTTP_PORT}}"
-export LMA_BACKEND_PORT="${LMA_BACKEND_PORT:-${_P_BACKEND:-$_C_BACKEND_PORT}}"
-export LMA_STOREFRONT_PORT="${LMA_STOREFRONT_PORT:-${_P_STOREFRONT:-$_C_STOREFRONT_PORT}}"
+export LMA_REDIS_PORT="${LMA_REDIS_PORT:-$_P_REDIS}"
+export LMA_HTTP_PORT="${LMA_HTTP_PORT:-$_P_HTTP}"
 export LMA_POSTGRES_IMAGE="${LMA_POSTGRES_IMAGE:-$_C_POSTGRES_IMAGE}"
 export LMA_REDIS_IMAGE="${LMA_REDIS_IMAGE:-$_C_REDIS_IMAGE}"
 export LMA_PROXY_IMAGE="${LMA_PROXY_IMAGE:-$_C_PROXY_IMAGE}"
 LMA_DOMAIN="${LMA_DOMAIN:-$_C_DOMAIN}"
-BACKEND_DIR="${LMA_BACKEND_DIR:-$_C_BACKEND_DIR}"
+BACKEND_NAME="$_C_BACKEND_NAME"
+BACKEND_DIR="$_C_BACKEND_DIR"
+MAIN_STORE="$_C_MAIN_STORE"
+# the proxy sends the backend routes here and everything else to the main store
+LMA_BACKEND_PORT="$(app_port "$BACKEND_NAME")"
+LMA_STOREFRONT_PORT="$(app_port "$MAIN_STORE")"
+export LMA_BACKEND_PORT LMA_STOREFRONT_PORT
 LMA_ALLOWED_HOSTS="$_C_ALLOWED_HOSTS"
 LMA_ADMIN_EMAIL="${LMA_ADMIN_EMAIL:-$_C_ADMIN_EMAIL}"
 # env > config > secrets.env
@@ -241,9 +254,6 @@ LMA_COOKIE_SECRET="$_S_COOKIE_SECRET"
 if [ "$LMA_HTTP_PORT" = "80" ]; then LMA_BASE_URL="http://$LMA_DOMAIN"; else LMA_BASE_URL="http://$LMA_DOMAIN:$LMA_HTTP_PORT"; fi
 PG_CONTAINER="$LMA_COMPOSE_PROJECT-postgres"
 REDIS_CONTAINER="$LMA_COMPOSE_PROJECT-redis"
-STOREFRONT_DIR="${LMA_STOREFRONT_DIR:-$_C_STOREFRONT_DIR}"
-BACKEND_NAME="$_C_BACKEND_NAME"
-STORE_NAME="$_C_STORE_NAME"
 
 COMPOSE=(docker compose -f "$COMPOSE_FILE")
 
@@ -265,10 +275,10 @@ warn_weak_secrets() {
   note "  put a real one in that file: openssl rand -hex 32"
 }
 
-# Medusa writes wherever its env points, and lma's checks read this stack
+# a DATABASE_URL exported for another database would be overridden by lma's own: refuse rather than surprise
 guard_database() {
   local problem
-  problem="$(node "$LIB/db-target.js" "$ROOT/$BACKEND_DIR/.env" "$LMA_PG_PORT")"
+  problem="$(node "$LIB/db-target.js" "$LMA_PG_PORT")"
   [ -z "$problem" ] && return 0
   red "$problem"
   note "  so lma did not write to it. lma show-env has the right url; run medusa yourself if you do mean that database"
@@ -284,6 +294,13 @@ uri_part() {
 
 db_url() {
   printf 'postgres://%s:%s@localhost:%s/%s' "$(uri_part "$LMA_DB_USER")" "$(uri_part "$LMA_DB_PASSWORD")" "$LMA_PG_PORT" "$(uri_part "$LMA_DB_NAME")"
+}
+
+# the keys that name a port in the env files are lma's, rewritten here when a port moved: a build outside lma then sees the right ones
+sync_env() {
+  [ "$DRY_RUN" = "1" ] && return 0
+  local line
+  LMA_DATABASE_URL="$(db_url)" LMA_REDIS_URL="redis://localhost:$LMA_REDIS_PORT" node "$LIB/wire.js" "$ROOT" | while IFS= read -r line; do note "$line"; done
 }
 
 # one mutating lma per project; racing starts produce half-created containers
@@ -360,10 +377,9 @@ db_table_count() {
 backend_cli() {
   (
     cd "$ROOT/$BACKEND_DIR" || exit 1
-    if [ ! -f .env ]; then
-      export DATABASE_URL="${DATABASE_URL:-$(db_url)}"
-      export REDIS_URL="${REDIS_URL:-redis://localhost:$LMA_REDIS_PORT}"
-    fi
+    # this stack's, whatever the .env says: dotenv does not override an export
+    DATABASE_URL="$(db_url)"
+    export DATABASE_URL REDIS_URL="redis://localhost:$LMA_REDIS_PORT"
     # --no: with node_modules gone, npx would fetch the unrelated package called medusa and hand it these arguments
     npx --no medusa "$@"
   )
@@ -496,8 +512,6 @@ publishable_key() {
 # a column for the start messages, as wide as the longest default name
 label() { printf '%-11s' "$1:"; }
 
-app_port() { if [ "$1" = "$BACKEND_NAME" ]; then printf '%s' "$LMA_BACKEND_PORT"; else printf '%s' "$LMA_STOREFRONT_PORT"; fi; }
-
 # the mark is where lma logs --since-restart begins
 launch_app() {
   local log="$LOG_DIR/$1.log" pid
@@ -520,15 +534,14 @@ start_backend() {
     note "$(label "$BACKEND_NAME") starting dev server"
     (
       cd "$ROOT/$BACKEND_DIR" || exit 1
-      export PORT="$LMA_BACKEND_PORT"
-      # set even when the app has a .env: dotenv does not override an export
+      # exported, so they win over the app's .env: dotenv does not override an export
+      DATABASE_URL="$(db_url)"
+      export PORT="$LMA_BACKEND_PORT" DATABASE_URL REDIS_URL="redis://localhost:$LMA_REDIS_PORT"
       [ -n "$LMA_ALLOWED_HOSTS" ] && export __MEDUSA_ADMIN_ADDITIONAL_ALLOWED_HOSTS="$LMA_ALLOWED_HOSTS"
       # merged with the app's .env, never replacing it
       export STORE_CORS="$_CORS_STORE" ADMIN_CORS="$_CORS_ADMIN" AUTH_CORS="$_CORS_AUTH"
-      # inject dev defaults only when the app has no .env of its own
+      # the secrets are the app's own once it has a .env
       if [ ! -f .env ]; then
-        export DATABASE_URL="${DATABASE_URL:-$(db_url)}"
-        export REDIS_URL="${REDIS_URL:-redis://localhost:$LMA_REDIS_PORT}"
         export JWT_SECRET="${JWT_SECRET:-$LMA_JWT_SECRET}" COOKIE_SECRET="${COOKIE_SECRET:-$LMA_COOKIE_SECRET}"
       fi
       launch_app "$BACKEND_NAME"
@@ -536,54 +549,62 @@ start_backend() {
   fi
 }
 
-# what the store's own env files set stays theirs: an export would win over them
-store_sets() { grep -qsE "^[[:space:]]*(export[[:space:]]+)?$1=[^[:space:]]" "$ROOT/$STOREFRONT_DIR/.env" "$ROOT/$STOREFRONT_DIR/.env.local"; }
-store_default() { store_sets "$1" || export "$1=${!1:-$2}"; }
+# what a store's own env files set stays its own, apart from the keys lma owns: an export would win over them
+store_sets() { grep -qsE "^[[:space:]]*(export[[:space:]]+)?$2=[^[:space:]]" "$ROOT/$1/.env" "$ROOT/$1/.env.local"; }
+store_default() { store_sets "$1" "$2" || export "$2=${!2:-$3}"; }
 
-SKIPPED_STORE=0
+SKIPPED=""
 
 start_store() {
-  local pid key=""
-  if port_up "$LMA_STOREFRONT_PORT"; then
-    note "$(label "$STORE_NAME") already running on :$LMA_STOREFRONT_PORT"
-  elif pid="$(app_pid "$STORE_NAME")"; then
-    note "$(label "$STORE_NAME") already running as pid $pid, its port is closed for now"
+  local app="$1" dir port pid key=""
+  dir="$(app_dir "$app")"
+  port="$(app_port "$app")"
+  if port_up "$port"; then
+    note "$(label "$app") already running on :$port"
+  elif pid="$(app_pid "$app")"; then
+    note "$(label "$app") already running as pid $pid, its port is closed for now"
   else
-    if ! store_sets NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY; then
-      docker_running || { red "$STORE_NAME: docker is not running; lma start brings the stack up"; SKIPPED_STORE=1; return 0; }
+    if ! store_sets "$dir" NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY; then
+      docker_running || { red "$app: docker is not running; lma start brings the stack up"; SKIPPED="$SKIPPED $app"; return 0; }
       key="$(publishable_key || true)"
       if [ -z "$key" ]; then
-        red "$STORE_NAME: skipped; no publishable API key; create one at $LMA_BASE_URL/app → Settings → Publishable API Keys, then: lma restart"
-        SKIPPED_STORE=1
+        red "$app: skipped; no publishable API key; create one at $LMA_BASE_URL/app → Settings → Publishable API Keys, then: lma restart"
+        SKIPPED="$SKIPPED $app"
         return 0
       fi
     fi
-    note "$(label "$STORE_NAME") starting dev server"
+    note "$(label "$app") starting dev server"
     (
-      cd "$ROOT/$STOREFRONT_DIR" || exit 1
-      export PORT="$LMA_STOREFRONT_PORT"
-      store_default MEDUSA_BACKEND_URL "http://localhost:$LMA_BACKEND_PORT"
-      store_default NEXT_PUBLIC_MEDUSA_BACKEND_URL "http://localhost:$LMA_BACKEND_PORT"
-      store_default NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY "$key"
-      store_default NEXT_PUBLIC_BASE_PATH ""
-      launch_app "$STORE_NAME"
+      cd "$ROOT/$dir" || exit 1
+      # lma owns where the store connects, whatever its env files say
+      export PORT="$port" MEDUSA_BACKEND_URL="http://localhost:$LMA_BACKEND_PORT" NEXT_PUBLIC_MEDUSA_BACKEND_URL="http://localhost:$LMA_BACKEND_PORT"
+      store_default "$dir" NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY "$key"
+      store_default "$dir" NEXT_PUBLIC_BASE_PATH ""
+      launch_app "$app"
     )
   fi
 }
 
 start_apps() {
+  local app dir
   if [ "$DRY_RUN" = "1" ]; then
     [ -n "$LMA_ALLOWED_HOSTS" ] && plan "__MEDUSA_ADMIN_ADDITIONAL_ALLOWED_HOSTS=$LMA_ALLOWED_HOSTS"
     plan "STORE_CORS=$_CORS_STORE"
     plan "ADMIN_CORS=$_CORS_ADMIN"
     plan "AUTH_CORS=$_CORS_AUTH"
     [ -d "$ROOT/$BACKEND_DIR" ] && plan "cd $BACKEND_DIR && npm run dev (PORT=$LMA_BACKEND_PORT)"
-    [ -d "$ROOT/$STOREFRONT_DIR" ] && plan "cd $STOREFRONT_DIR && npm run dev (PORT=$LMA_STOREFRONT_PORT)"
+    for app in $(store_names); do
+      dir="$(app_dir "$app")"
+      [ -d "$ROOT/$dir" ] && plan "cd $dir && npm run dev (PORT=$(app_port "$app"))"
+    done
     return 0
   fi
   mkdir -p "$LOG_DIR" "$RUN_DIR"
   if [ -d "$ROOT/$BACKEND_DIR" ]; then start_backend; else note "$(label "$BACKEND_NAME") no folder at $BACKEND_DIR, nothing to start"; fi
-  if [ -d "$ROOT/$STOREFRONT_DIR" ]; then start_store; else note "$(label "$STORE_NAME") no folder at $STOREFRONT_DIR, nothing to start"; fi
+  for app in $(store_names); do
+    dir="$(app_dir "$app")"
+    if [ -d "$ROOT/$dir" ]; then start_store "$app"; else note "$(label "$app") no folder at $dir, nothing to start"; fi
+  done
   return 0
 }
 
@@ -592,7 +613,7 @@ wait_app() {
   local app="$1" port alive=0
   port="$(app_port "$app")"
   port_up "$port" && { green "$app up on :$port"; return 0; }
-  { [ "$app" = "$STORE_NAME" ] && [ "$SKIPPED_STORE" = "1" ]; } && return 1
+  case " $SKIPPED " in *" $app "*) return 1 ;; esac
   note "waiting for $app on :$port ..."
   for _ in $(seq 1 "${LMA_APP_WAIT:-750}"); do
     port_up "$port" && { green "$app up on :$port"; return 0; }
@@ -609,9 +630,10 @@ wait_app() {
 
 # every app, even after one failed: the report should be complete
 wait_apps() {
-  local failed=0
-  [ -d "$ROOT/$BACKEND_DIR" ] && { wait_app "$BACKEND_NAME" || failed=1; }
-  [ -d "$ROOT/$STOREFRONT_DIR" ] && { wait_app "$STORE_NAME" || failed=1; }
+  local failed=0 app
+  for app in $(app_names); do
+    [ -d "$ROOT/$(app_dir "$app")" ] && { wait_app "$app" || failed=1; }
+  done
   return "$failed"
 }
 
@@ -641,17 +663,15 @@ stop_apps() {
 
 restart_app() {
   local app="$1" dir
-  case "$app" in
-    "$BACKEND_NAME") dir="$BACKEND_DIR" ;;
-    "$STORE_NAME") dir="$STOREFRONT_DIR" ;;
-    *) red "no app named '$app'; this project has: $BACKEND_NAME $STORE_NAME"; exit 1 ;;
-  esac
+  app_known "$app" || { red "no app named '$app'; this project has: $(app_names | tr '\n' ' ')"; exit 1; }
+  dir="$(app_dir "$app")"
   [ -d "$ROOT/$dir" ] || { red "$app has no folder at $dir"; exit 1; }
   warn_moved_ports
+  sync_env
   stop_app "$app"
   if [ "$DRY_RUN" = "1" ]; then plan "cd $dir && npm run dev (PORT=$(app_port "$app"))"; return 0; fi
   mkdir -p "$LOG_DIR" "$RUN_DIR"
-  if [ "$app" = "$BACKEND_NAME" ]; then start_backend; else start_store; fi
+  if [ "$app" = "$BACKEND_NAME" ]; then start_backend; else start_store "$app"; fi
   wait_app "$app"
 }
 
@@ -676,22 +696,24 @@ migrate_flags() {
   case "$help" in *--execute-safe-search*) printf '%s\n' --execute-safe-search ;; esac
 }
 
-moved_port() { # $1 = name, $2 = port in use, $3 = allocated, $4 = preferred
-  [ -n "$3" ] && [ "$3" != "$4" ] && [ "$2" = "$3" ] || return 1
-  red "$1 is on :$2, not its preferred :$4, which was busy"
+# only a port the config asks for can be missed; the rest are the first free in their band, wherever that is
+moved_port() { # $1 = name, $2 = port in use, $3 = allocated, $4 = port in the config
+  [ -n "$4" ] && [ "$3" != "$4" ] && [ "$2" = "$3" ] || return 1
+  red "$1 is on :$2, not its preferred :$4, which was taken"
 }
 
 # an allocation stays pinned, so this repeats until it is dealt with
 warn_moved_ports() {
-  local moved=""
-  moved_port postgres "$LMA_PG_PORT" "${_P_POSTGRES:-}" "$_C_PG_PORT" && moved=1
-  moved_port redis "$LMA_REDIS_PORT" "${_P_REDIS:-}" "$_C_REDIS_PORT" && moved=1
-  moved_port proxy "$LMA_HTTP_PORT" "${_P_HTTP:-}" "$_C_HTTP_PORT" && moved=1
-  [ -d "$ROOT/$BACKEND_DIR" ] && moved_port "$BACKEND_NAME" "$LMA_BACKEND_PORT" "${_P_BACKEND:-}" "$_C_BACKEND_PORT" && moved=1
-  [ -d "$ROOT/$STOREFRONT_DIR" ] && moved_port "$STORE_NAME" "$LMA_STOREFRONT_PORT" "${_P_STOREFRONT:-}" "$_C_STOREFRONT_PORT" && moved=1
+  local moved="" app port
+  moved_port postgres "$LMA_PG_PORT" "$_P_POSTGRES" "$_C_PG_PORT" && moved=1
+  moved_port redis "$LMA_REDIS_PORT" "$_P_REDIS" "$_C_REDIS_PORT" && moved=1
+  moved_port proxy "$LMA_HTTP_PORT" "$_P_HTTP" "$_C_HTTP_PORT" && moved=1
+  for app in $(app_names); do
+    port="$(app_port "$app")"
+    [ -d "$ROOT/$(app_dir "$app")" ] && moved_port "$app" "$port" "$port" "$(app_cfg_port "$app")" && moved=1
+  done
   [ -z "$moved" ] && return 0
-  dim "  anything naming the old port, such as $BACKEND_DIR/.env or $STOREFRONT_DIR/.env.local, now misses it or reaches another project"
-  dim "  once the port is free: lma ports --reset. to keep the new one, set it in the lma config"
+  dim "  once the port is free: lma ports --reset. to keep the new one, set it in the lma config, or take the port out and let lma pick"
 }
 
 drop_and_recreate_db() {
@@ -730,9 +752,10 @@ status_report() {
     fi
     services="$services${services:+,}\"$svc\":{\"state\":\"$state\",\"port\":$port}"
   done
-  for app in "$BACKEND_NAME" "$STORE_NAME"; do
+  for app in $(app_names); do
     port="$(app_port "$app")"
-    if [ "$app" = "$BACKEND_NAME" ]; then dir="$BACKEND_DIR"; role=backend; else dir="$STOREFRONT_DIR"; role=store; fi
+    dir="$(app_dir "$app")"
+    role="$(app_role "$app")"
     expected=false; [ -d "$ROOT/$dir" ] && expected=true
     up=false; port_up "$port" && up=true
     if [ "$up" = "true" ]; then
@@ -830,12 +853,15 @@ case "$cmd" in
   start|up)
     [ "$DRY_RUN" = "1" ] || need_docker
     warn_moved_ports
+    sync_env
     warn_weak_secrets
     run "${COMPOSE[@]}" up -d
     [ "$DRY_RUN" = "1" ] || wait_healthy
     note "postgres:   localhost:$LMA_PG_PORT/$LMA_DB_NAME  (url: lma show-env)"
     note "redis:      redis://localhost:$LMA_REDIS_PORT"
-    note "$(label "$STORE_NAME") $LMA_BASE_URL"
+    for app in $(store_names); do
+      if [ "$app" = "$MAIN_STORE" ]; then note "$(label "$app") $LMA_BASE_URL"; else note "$(label "$app") http://localhost:$(app_port "$app")"; fi
+    done
     note "admin:      $LMA_BASE_URL/app  ($LMA_ADMIN_EMAIL, password: lma admin)"
     if [ "$LMA_DOMAIN" != "localhost" ] && ! grep -q "$LMA_DOMAIN" /etc/hosts 2>/dev/null; then
       red "missing hosts entry; run once:  echo '127.0.0.1 $LMA_DOMAIN' | sudo tee -a /etc/hosts"
@@ -864,6 +890,7 @@ case "$cmd" in
     fi
     [ "$DRY_RUN" = "1" ] || need_docker
     warn_moved_ports
+    sync_env
     warn_weak_secrets
     stop_apps
     run "${COMPOSE[@]}" down
@@ -887,26 +914,23 @@ case "$cmd" in
     run_command "$@"
     ;;
   logs)
-    case "${1:-}" in
-      "$BACKEND_NAME"|"$STORE_NAME")
-        [ -f "$LOG_DIR/$1.log" ] || { red "no log yet at $LOG_DIR/$1.log"; exit 1; }
-        if [ "$#" -gt 1 ]; then
-          log_app="$1"; shift
-          node "$LIB/logs.js" "$LOG_DIR/$log_app.log" "$@"
-        else
-          tail -f "$LOG_DIR/$1.log"
-        fi
-        ;;
-      *)
-        case " $* " in
-          *" --errors "*|*" --since-restart "*)
-            red "--errors and --since-restart only work on an app: $BACKEND_NAME $STORE_NAME"
-            exit 2
-            ;;
-        esac
-        "${COMPOSE[@]}" logs -f "$@"
-        ;;
-    esac
+    if [ -n "${1:-}" ] && app_known "$1"; then
+      [ -f "$LOG_DIR/$1.log" ] || { red "no log yet at $LOG_DIR/$1.log"; exit 1; }
+      if [ "$#" -gt 1 ]; then
+        log_app="$1"; shift
+        node "$LIB/logs.js" "$LOG_DIR/$log_app.log" "$@"
+      else
+        tail -f "$LOG_DIR/$1.log"
+      fi
+    else
+      case " $* " in
+        *" --errors "*|*" --since-restart "*)
+          red "--errors and --since-restart only work on an app: $(app_names | tr '\n' ' ')"
+          exit 2
+          ;;
+      esac
+      "${COMPOSE[@]}" logs -f "$@"
+    fi
     ;;
   psql)
     tty_flags=(-i); [ -t 0 ] && [ -t 1 ] && tty_flags=(-it)
@@ -974,6 +998,7 @@ case "$cmd" in
     need_docker
     "${COMPOSE[@]}" up -d
     wait_healthy
+    sync_env
     guard_database || exit 1
     flags="$(migrate_flags)" || exit 1
     note "running Medusa migrations in $BACKEND_DIR..."
@@ -1010,7 +1035,7 @@ case "$cmd" in
     ;;
   show-env)
     cat <<EOF
-# add to $BACKEND_DIR/.env
+# lma keeps these in $BACKEND_DIR/.env and exports them on every start
 DATABASE_URL=$(db_url)
 REDIS_URL=redis://localhost:$LMA_REDIS_PORT
 

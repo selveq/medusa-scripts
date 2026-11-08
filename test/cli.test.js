@@ -149,5 +149,5 @@ test('ports prints the allocated map and where it is pinned', () => {
     const r = cli(['ports'], { cwd: dir })
     assert.strictEqual(r.status, 0, r.out)
     assert.match(r.out, /postgres +\d+/)
-    assert.match(r.out, /cache: .*node_modules\/\.local-medusa-app-cache\/ports\.json/)
+    assert.match(r.out, /pins: .*\.local-medusa-app\/[^/]+\/ports\.json/)
 })

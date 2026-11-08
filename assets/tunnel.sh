@@ -48,9 +48,7 @@ read_config() {
   const t = c.tunnel || {};
   const hosts = t.hostnames || {};
   const rows = [];
-  for (const k of Object.keys(c.apps || {})) {
-    if (ports[k]) rows.push([k, ports[k], hosts[k] || ""].join("\t"));
-  }
+  for (const a of [ap.backend, ...ap.stores]) rows.push([a.name, ports[a.name], hosts[a.name] || ""].join("\t"));
   const sec = secrets.ensure(root);
   const admin = process.env.LMA_ADMIN_PASSWORD || (c.admin || {}).password || sec.values.LMA_ADMIN_PASSWORD;
   const q = (v) => "\x27" + String(v).replace(/\x27/g, "\x27\\\x27\x27") + "\x27";
@@ -60,7 +58,8 @@ read_config() {
     `_T_NAME=${q(t.name || cfg.project(root, c))}`,
     `_T_METRICS_PORT=${q(t.metricsPort || 20000 + (lib.projectId(root, c) % 10000))}`,
     `_T_BACKEND_NAME=${q(ap.backend.name)}`,
-    `_T_STORE_NAME=${q(ap.store.name)}`,
+    `_T_MAIN_STORE=${q(ap.main)}`,
+    `_T_STORES=${q(ap.stores.map((s) => s.name).join("\n"))}`,
     `_T_BACKEND_PORT=${q(ports[ap.backend.name] || "")}`,
     `_T_ADMIN_WEAK=${q(secrets.isWeak(admin) || require("node:fs").existsSync(require("node:path").join(require("node:path").dirname(sec.file), "seeded-weak")) ? 1 : 0)}`,
     `_T_ADMIN_IN_CONFIG=${q((c.admin || {}).password ? 1 : 0)}`,
@@ -126,6 +125,7 @@ named_map() { app_map | awk -F'\t' '$3 != ""'; }
 mode_map() { if [ "$1" = "quick" ]; then app_map; else named_map; fi; }
 
 app_port() { app_map | awk -F'\t' -v a="$1" '$1 == a { print $2; exit }'; }
+is_store() { [ -n "$(printf '%s\n' "$_T_STORES" | grep -x "$1")" ]; }
 
 # a name cloudflare can resolve: dotted, never a bare address
 valid_host() {
@@ -426,21 +426,19 @@ cors_allowed() { # $1 = origin, $2 = backend port, $3 = route group
 }
 
 cors_check() { # $@ = selection
-    local sf_pub be_pub stale=0
+    local app port public stale=0
     [ -n "$_T_BACKEND_PORT" ] || return 0
     port_up "$_T_BACKEND_PORT" || return 0
-    sf_pub="$(app_map | awk -F'\t' -v a="$_T_STORE_NAME" '$1 == a { print $3 }')"
-    be_pub="$(app_map | awk -F'\t' -v a="$_T_BACKEND_NAME" '$1 == a { print $3 }')"
-    if [ -n "$sf_pub" ] && selected_has "$_T_STORE_NAME" "$@" &&
-        ! cors_allowed "https://$sf_pub" "$_T_BACKEND_PORT" /store/regions; then
-        warn "the backend rejects Origin https://$sf_pub (STORE_CORS)"
-        stale=1
-    fi
-    if [ -n "$be_pub" ] && selected_has "$_T_BACKEND_NAME" "$@" &&
-        ! cors_allowed "https://$be_pub" "$_T_BACKEND_PORT" /admin/users; then
-        warn "the backend rejects Origin https://$be_pub (ADMIN_CORS)"
-        stale=1
-    fi
+    while IFS=$'\t' read -r app port public; do
+        selected_has "$app" "$@" || continue
+        if is_store "$app"; then
+            cors_allowed "https://$public" "$_T_BACKEND_PORT" /store/regions ||
+                { warn "the backend rejects Origin https://$public (STORE_CORS)"; stale=1; }
+        elif [ "$app" = "$_T_BACKEND_NAME" ]; then
+            cors_allowed "https://$public" "$_T_BACKEND_PORT" /admin/users ||
+                { warn "the backend rejects Origin https://$public (ADMIN_CORS)"; stale=1; }
+        fi
+    done < <(named_map)
     [ "$stale" = "1" ] &&
         warn "  the backend started before that hostname was in the config; pick it up with: lma restart"
     return 0
@@ -588,7 +586,8 @@ cmd_start() {
 
 # throwaway trycloudflare URL, no account needed
 cmd_quick() {
-    local app="${1:-$_T_STORE_NAME}" port
+    local app="${1:-$_T_MAIN_STORE}" port
+    [ -n "$app" ] || die "This project has no store; name the app to publish: lma tunnel quick <app>"
     port="$(app_port "$app")"
     [ -n "$port" ] || die "Unknown app '$app'. Defined: $(app_map | cut -f1 | tr '\n' ' ')"
 
@@ -629,12 +628,12 @@ cmd_quick() {
 
     wait_ready || warn "URL assigned, but edge connections are still registering."
     report_up
-    if [ "$app" = "$_T_STORE_NAME" ]; then
+    if is_store "$app"; then
         warn "quick URL is not in backend CORS; browser API calls may fail; prefer: lma tunnel start"
     fi
     if [ "$app" = "$_T_BACKEND_NAME" ]; then
         check_admin_hosts "${url#https://}" "$port" ||
-            warn "  a throwaway hostname cannot be allowed in advance; for the admin use: lma tunnel start backend"
+            warn "  a throwaway hostname cannot be allowed in advance; for the admin use: lma tunnel start $_T_BACKEND_NAME"
     fi
 }
 

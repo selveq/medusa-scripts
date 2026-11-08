@@ -12,11 +12,9 @@ module.exports = {
     },
     apps: {
         backend: {
-            dir: 'apps/backend',
+            dir: 'apps/__BACKEND__',
         },
-        storefront: {
-            dir: 'apps/storefront',
-        },
+        '__STORE__': {},
     },
     proxy: {
         domain: 'localhost',

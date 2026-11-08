@@ -1,6 +1,6 @@
 {
   "name": "@selveq/medusa-scripts",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Local dev CLI for Medusa projects: dockerized postgres/redis/nginx, port allocation, db import/dump, admin seeding, cloudflare tunnel",
   "keywords": [
     "medusa",

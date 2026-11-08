@@ -81,7 +81,7 @@ const addScripts = (cwd, wanted) => {
 
 const init = (cwd, args) => {
     const project = config.slug(path.basename(cwd)) || 'app'
-    const vars = { PROJECT: project }
+    const vars = { PROJECT: project, BACKEND: 'backend', STORE: 'storefront' }
     const name = config.configName(cwd)
     const existing = config.configPath(cwd)
     console.log(`Initializing lma for '${project}' in ${cwd}`)
@@ -186,16 +186,15 @@ const main = () => {
         const dry = args.includes('-n') || args.includes('--dry-run')
         return require('../lib/ports.js')
             .resolve(root, { reset, frozen: !reset || dry })
-            .then(({ ports, bases, cachePath }) => {
-                if (args.includes('--json')) {
-                    const moved = Object.keys(ports).filter((svc) => ports[svc] !== bases[svc])
-                    return console.log(JSON.stringify({ ports, preferred: bases, moved, cache: cachePath }))
-                }
+            .then(({ ports, preferred, pinPath }) => {
+                // preferred holds only the ports the config asks for; the rest are the first free in their band
+                const moved = Object.keys(preferred).filter((svc) => ports[svc] !== preferred[svc])
+                if (args.includes('--json')) return console.log(JSON.stringify({ ports, preferred, moved, pins: pinPath }))
                 for (const [svc, p] of Object.entries(ports)) {
-                    const moved = p !== bases[svc] ? `  (preferred ${bases[svc]} busy)` : ''
-                    console.log(`  ${svc.padEnd(12)} ${p}${moved}`)
+                    const note = moved.includes(svc) ? `  (preferred ${preferred[svc]} taken)` : ''
+                    console.log(`  ${svc.padEnd(12)} ${p}${note}`)
                 }
-                console.log(`\ncache: ${cachePath}`)
+                console.log(`\npins: ${pinPath}`)
             })
             .catch((e) => { console.error(e.message); process.exit(1) })
     }

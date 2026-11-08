@@ -55,7 +55,15 @@ const merge = (base, extra) => {
 
 const dirs = []
 
+// pins left by earlier tests' projects would move a new one off its band: a test project starts alone on its machine
+const freshPins = () => {
+    const home = paths.home()
+    if (!fs.existsSync(home)) return
+    for (const dir of fs.readdirSync(home)) fs.rmSync(path.join(home, dir, 'ports.json'), { force: true })
+}
+
 const project = (config = {}, { type } = {}) => {
+    freshPins()
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lma-test-')))
     dirs.push(dir)
     const pkg = { name: 'demo-project', version: '1.0.0', private: true }
@@ -271,7 +279,7 @@ const cli = (args, { cwd, env = {} } = {}) => {
 
 module.exports = {
     PKG, ASSETS, FAKE_BIN, DEFAULTS, PORTS,
-    project, cleanup, holdAppPort, serveApp, daemon, alive, killQuietly, started, sleep: sleepSync,
+    project, freshPins, cleanup, holdAppPort, serveApp, daemon, alive, killQuietly, started, sleep: sleepSync,
     local, tunnel, cli, onTerminal,
     dockerAt, dockerCalls, ranDocker, composeImages, cloudflaredCalls, devRuns, devEnv, npxRuns,
 }

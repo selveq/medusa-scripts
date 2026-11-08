@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+- No port is chosen in advance. Each service takes the first free port in its band: backend 9000 to 9999, stores 8000 to 8999, proxy from 80, Postgres from 5432, Redis from 6379. `lma init` writes none into `lma.js`, and a port in the config is an override that says where the search starts.
+- lma wires the apps to the ports it found on every start: `PORT`, `DATABASE_URL` and `REDIS_URL` for the backend and the backend url for each store are exported, and rewritten in the backend `.env` and the stores' `.env.local` when a port moved. Those files no longer need editing by hand.
+- A project can have any number of stores. Under `apps`, the key `backend` is the backend and every other key is a store, started, stopped, reported and restarted by its name, with its origin in `STORE_CORS`; `proxy.store` names the one nginx sends `/` to, the first store by default. The backend is `backend` to every lma command, with its folder in `dir`. `role` is gone: a config with `backend` and `storefront` keys works as it is, one that marked another key as the backend is refused with the fix.
+- The port map moved from `node_modules` to the state folder, so a clean install keeps the ports, and a port pinned by another lma project on this machine counts as taken whether that stack is up or not, so two projects never trade ports. An old map moves by itself, and `lma ports --json` says `pins` where it said `cache`.
+- `lma migrate` and `lma seed-admin` still refuse a `DATABASE_URL` exported for another database; one left in the backend `.env` is rewritten instead of refused.
+- `LMA_BACKEND_PORT` and `LMA_STOREFRONT_PORT` no longer override an app's port.
+
 ## 0.3.0
 
 - `lma init` in an empty folder asks about Docker and the names of the backend and the store, installs the latest Medusa with its own installer, assigns ports and starts it.

@@ -7,12 +7,13 @@ const path = require('node:path')
 const { PassThrough } = require('node:stream')
 const install = require('../lib/install.js')
 const { spawnSync } = require('node:child_process')
-const { cli, onTerminal, ranDocker, devRuns, npxRuns, cleanup } = require('./support/harness.js')
+const { cli, onTerminal, ranDocker, devRuns, npxRuns, freshPins, cleanup } = require('./support/harness.js')
 
 const roots = []
 test.after(() => { for (const d of roots.splice(0)) fs.rmSync(d, { recursive: true, force: true }); cleanup() })
 
 const empty = (name = 'tutor-two') => {
+    freshPins()
     const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lma-init-')))
     roots.push(base)
     const dir = path.join(base, name)
@@ -113,32 +114,35 @@ test('init moves the apps to their names and leaves no trace of the old ones', (
     assert.ok(!fs.existsSync(path.join(dir, 'apps', 'api', 'node_modules')), 'links to the old folders are gone')
 })
 
-test('init records the two apps and their assigned ports in the config', () => {
+// the ports lma found and pinned for the project
+const assigned = (dir) => JSON.parse(cli(['ports', '--json'], { cwd: dir, env: sideLogs(dir) }).stdout).ports
+
+test('init records the two apps in the config, and no port: lma picks them', () => {
     const { dir, r } = installed()
     assert.strictEqual(r.status, 0, r.out)
     const cfg = require(path.join(dir, 'lma.js'))
     assert.strictEqual(cfg.project, 'tutor-two')
-    assert.strictEqual(cfg.apps.api.role, 'backend')
-    for (const port of [cfg.apps.api.port, cfg.apps.frontend.port, cfg.services.postgres.port, cfg.services.redis.port, cfg.proxy.port]) {
-        assert.ok(Number.isInteger(port) && port > 0, String(port))
-    }
+    assert.deepStrictEqual(cfg.apps, { backend: { dir: 'apps/api' }, frontend: {} })
+    assert.doesNotMatch(text(dir, 'lma.js'), /\bport:/)
+    const map = assigned(dir)
+    for (const svc of ['backend', 'frontend', 'postgres', 'redis', 'http']) assert.ok(Number.isInteger(map[svc]) && map[svc] > 0, svc)
 })
 
-test('the env files point at the assigned ports and carry real secrets', () => {
+test('the env files point at the ports lma found and carry real secrets', () => {
     const { dir, r } = installed()
     assert.strictEqual(r.status, 0, r.out)
-    const cfg = require(path.join(dir, 'lma.js'))
+    const map = assigned(dir)
     const backendEnv = text(dir, 'apps/api/.env')
-    assert.match(backendEnv, new RegExp(`DATABASE_URL=postgres://medusa:medusa@localhost:${cfg.services.postgres.port}/medusa-backend`))
-    assert.match(backendEnv, new RegExp(`REDIS_URL=redis://localhost:${cfg.services.redis.port}`))
-    assert.match(backendEnv, new RegExp(`PORT=${cfg.apps.api.port}`))
-    assert.match(backendEnv, new RegExp(`STORE_CORS=.*http://localhost:${cfg.apps.frontend.port}`))
+    assert.match(backendEnv, new RegExp(`DATABASE_URL=postgres://medusa:medusa@localhost:${map.postgres}/medusa-backend`))
+    assert.match(backendEnv, new RegExp(`REDIS_URL=redis://localhost:${map.redis}`))
+    assert.match(backendEnv, new RegExp(`PORT=${map.backend}`))
+    assert.match(backendEnv, new RegExp(`STORE_CORS=.*http://localhost:${map.frontend}`))
     assert.doesNotMatch(backendEnv, /supersecret|medusa\.com/)
     assert.strictEqual(backendEnv.match(/^REDIS_URL=/gm).length, 1, 'the installer\'s line is replaced, not joined')
     assert.match(backendEnv, /AUTH_MFA_ENCRYPTION_KEY=keepme/)
     assert.strictEqual(fs.statSync(path.join(dir, 'apps/api/.env')).mode & 0o777, 0o600)
     const storeEnv = text(dir, 'apps/frontend/.env.local')
-    assert.match(storeEnv, new RegExp(`NEXT_PUBLIC_MEDUSA_BACKEND_URL=http://localhost:${cfg.apps.api.port}`))
+    assert.match(storeEnv, new RegExp(`NEXT_PUBLIC_MEDUSA_BACKEND_URL=http://localhost:${map.backend}`))
     assert.match(storeEnv, /NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY=pk_test/)
     assert.match(storeEnv, /NEXT_PUBLIC_DEFAULT_REGION=dk/, 'lines lma does not own stay')
     assert.doesNotMatch(text(dir, 'apps/frontend/.env.template'), /pk_test/, 'the template holds no key')
@@ -162,10 +166,10 @@ test('the pnpm setting the starter ships does not make npm warn on every command
 test('the store follows the port lma gives it, and keeps its other scripts', () => {
     const { dir, r } = installed()
     assert.strictEqual(r.status, 0, r.out)
-    const cfg = require(path.join(dir, 'lma.js'))
+    const map = assigned(dir)
     const { scripts } = json(dir, 'apps/frontend/package.json')
-    assert.strictEqual(scripts.dev, `next dev -p \${PORT:-${cfg.apps.frontend.port}}`)
-    assert.strictEqual(scripts.start, `next start -p \${PORT:-${cfg.apps.frontend.port}}`)
+    assert.strictEqual(scripts.dev, `next dev -p \${PORT:-${map.frontend}}`)
+    assert.strictEqual(scripts.start, `next start -p \${PORT:-${map.frontend}}`)
     assert.strictEqual(scripts.build, 'next build')
 })
 
@@ -181,7 +185,7 @@ test('init installs lma into the project, migrates, then starts both apps', () =
     assert.ok(ranDocker(dir, 'compose', 'up', '-d'))
     assert.deepStrictEqual(devRuns(dir).filter((run) => run.argv[0] === 'run').map((run) => path.basename(run.cwd)).sort(), ['api', 'frontend'])
     assert.match(r.out, /frontend: http:\/\/localhost:\d+/)
-    assert.match(r.out, /api: http:\/\/localhost:\d+\/app/)
+    assert.match(r.out, /backend: http:\/\/localhost:\d+\/app/)
     assert.match(r.out, /The admin login: npx lma admin/)
     const migrated = npxRuns(dir).find((run) => run.argv.includes('db:migrate') && !run.argv.includes('--help'))
     const started = devRuns(dir).find((run) => run.argv[0] === 'run')
@@ -279,7 +283,7 @@ for (const folder of ['shop (copy)', 'shop[1]']) {
     })
 }
 
-for (const [backend, store] of [['storefront', 'store'], ['api', 'backend'], ['storefront', 'backend']]) {
+for (const [backend, store] of [['storefront', 'store'], ['api', 'web']]) {
     test(`a backend called ${backend} and a store called ${store} land in their own folders`, () => {
         const dir = empty()
         const r = cli(['init', '--backend', backend, '--store', store, '--yes'], { cwd: dir, env: { ...env, ...sideLogs(dir) } })
@@ -288,6 +292,16 @@ for (const [backend, store] of [['storefront', 'store'], ['api', 'backend'], ['s
         assert.match(json(dir, `apps/${store}/package.json`).scripts.dev, /^next dev/)
     })
 }
+
+test('a store called backend is refused, since that is the backend\'s key in lma.js', async () => {
+    const dir = empty()
+    const r = cli(['init', '--backend', 'api', '--store', 'backend', '--yes'], { cwd: dir, env: { ...env, ...sideLogs(dir) } })
+    assert.notStrictEqual(r.status, 0)
+    assert.match(r.out, /'backend' is the backend; call the store something else/)
+    assert.deepStrictEqual(fs.readdirSync(dir), [])
+    const { said } = await answered(['backend', 'web'], { backend: 'api' })
+    assert.match(said, /'backend' is the backend/)
+})
 
 test('a new name holding an old one is renamed once, not twice', () => {
     const dir = empty()

@@ -78,7 +78,7 @@ jobs:
           npx lma destroy --dry-run
           npx lma reset-db --dry-run
           test -z "$(docker ps -aq)"
-          test ! -e node_modules/.local-medusa-app-cache/ports.json
+          test ! -e "$STATE/ports.json"
 
       - name: Start the stack for real
         working-directory: /tmp/scratch
@@ -147,7 +147,8 @@ jobs:
         working-directory: /tmp/my shop
         run: |
           npx lma status
-          port="$(node -p "require('./lma.js').apps.api.port")"
+          # the config names no port: lma found one and pinned it
+          port="$(npx lma ports --json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).ports.backend")"
           curl -fsS "http://localhost:$port/health"
           state="$(node -p "require('@selveq/medusa-scripts/lib/paths.js').stateDir('.')")"
           test -f "$state/secrets.env"
